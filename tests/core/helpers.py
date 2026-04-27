@@ -38,3 +38,23 @@ _DEFAULTS: dict[str, Any] = dict(
 def make_snapshot(**overrides: Any) -> MarketSnapshot:
     """全層クリア（LONG）のスナップショットを生成し、上書きを適用する。"""
     return MarketSnapshot(**{**_DEFAULTS, **overrides})
+
+
+# SHORT 全層通過のデフォルトは LONG と多くのフィールドが対称になる。
+_SHORT_DEFAULTS: dict[str, Any] = {
+    **_DEFAULTS,
+    "current_price": 99.8,  # vwap -0.2%
+    "momentum_5bar_pct": -0.5,  # < -0.3
+    "utc_open_price": 102.0,  # -2.16% (> -5%)
+    "rolling_24h_open": 105.0,  # -4.95% (> -10%)
+    "high_24h": 103.0,
+    "low_24h": 95.0,  # position ≒ 0.6
+    "flow_buy_sell_ratio": 0.5,  # < 1/1.5
+    "btc_ema_trend": "DOWNTREND",
+    "sentiment_score": -0.5,  # < -0.3
+}
+
+
+def make_short_snapshot(**overrides: Any) -> MarketSnapshot:
+    """全層クリア（SHORT）のスナップショットを生成し、上書きを適用する。"""
+    return MarketSnapshot(**{**_SHORT_DEFAULTS, **overrides})
