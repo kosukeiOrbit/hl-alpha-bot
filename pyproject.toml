@@ -1,0 +1,36 @@
+# Tool configuration only.
+# Runtime/dev dependencies live in requirements.txt / requirements-dev.txt.
+# Trading parameters live in config/settings.yaml (see docs/design.md ch.23).
+
+[tool.pytest.ini_options]
+addopts = "-v --cov=src --cov-report=term-missing"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "e2e: testnet を使うE2Eテスト（手動実行）",
+    "slow: 時間のかかるテスト",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "B", "UP"]
+
+[tool.black]
+line-length = 100
+target-version = ["py313"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+exclude = ["tests/", "scripts/"]
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false

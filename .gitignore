@@ -1,0 +1,85 @@
+# ============================================
+# 機密情報・絶対にcommitしないもの
+# ============================================
+.env
+.env.*
+!.env.example
+
+# secrets/ 内の実鍵
+secrets/.age-key
+secrets/secrets.yaml
+!secrets/secrets.enc.yaml
+!secrets/.age-key.example
+!secrets/.gitignore
+
+# ============================================
+# データ・ログ（ローカル）
+# ============================================
+data/*
+!data/.gitkeep
+!data/fixtures/
+
+logs/*
+!logs/.gitkeep
+
+# DB バックアップ
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# CSVエクスポート
+data/exports/
+
+# ============================================
+# Python
+# ============================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 仮想環境
+venv/
+.venv/
+env/
+
+# ビルド成果物
+build/
+dist/
+*.egg-info/
+*.egg
+
+# テスト
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ============================================
+# IDE
+# ============================================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints
+
+# ============================================
+# OS
+# ============================================
+Thumbs.db
+.DS_Store
+
+# ============================================
+# その他
+# ============================================
+# ローカルの一時メモ
+NOTES.md
+TODO.md
+scratch/
+tmp/
