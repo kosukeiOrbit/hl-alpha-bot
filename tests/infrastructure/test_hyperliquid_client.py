@@ -343,16 +343,318 @@ class TestFundingAndOI:
 
 
 # ────────────────────────────────────────────────
-# 未実装メソッドの NotImplementedError
+# _fetch_recent_candles
 # ────────────────────────────────────────────────
 
 
-class TestUnimplementedMethods:
+class TestFetchRecentCandles:
     @pytest.mark.asyncio
-    async def test_get_market_snapshot_raises_not_implemented(self) -> None:
+    async def test_returns_candles_in_chronological_order(self) -> None:
         client = HyperLiquidClient(network="testnet")
-        with pytest.raises(NotImplementedError, match=r"PR6\.2"):
+        mock_candles = [
+            {"t": 1700000000000, "o": "65000", "c": "65100", "v": "10"},
+            {"t": 1700000300000, "o": "65100", "c": "65200", "v": "12"},
+            {"t": 1700000600000, "o": "65200", "c": "65150", "v": "8"},
+        ]
+        client._info = MagicMock()
+        client._info.candles_snapshot = MagicMock(return_value=mock_candles)
+        result = await client._fetch_recent_candles("BTC", "5m", 3)
+        assert len(result) == 3
+        assert result[0]["t"] == 1700000000000
+        assert result[-1]["t"] == 1700000600000
+
+    @pytest.mark.asyncio
+    async def test_unsupported_interval_raises(self) -> None:
+        client = HyperLiquidClient(network="testnet")
+        with pytest.raises(ExchangeError, match="Unsupported interval"):
+            await client._fetch_recent_candles("BTC", "7m", 3)
+
+    @pytest.mark.asyncio
+    async def test_sdk_error_propagates(self) -> None:
+        client = HyperLiquidClient(network="testnet")
+        client._info = MagicMock()
+        client._info.candles_snapshot = MagicMock(
+            side_effect=ConnectionError("timeout")
+        )
+        with pytest.raises(ExchangeError, match="Failed to fetch candles"):
+            await client._fetch_recent_candles("BTC", "5m", 3)
+
+
+# ────────────────────────────────────────────────
+# _get_utc_day_open_price
+# ────────────────────────────────────────────────
+
+
+class TestUTCDayOpenPrice:
+    @pytest.mark.asyncio
+    async def test_returns_open_of_first_1h_candle(self) -> None:
+        client = HyperLiquidClient(network="testnet")
+        client._info = MagicMock()
+        client._info.candles_snapshot = MagicMock(
+            return_value=[{"t": 0, "o": "65432.1", "c": "65500", "v": "100"}]
+        )
+        result = await client._get_utc_day_open_price("BTC")
+        assert result == Decimal("65432.1")
+
+    @pytest.mark.asyncio
+    async def test_no_candle_raises(self) -> None:
+        client = HyperLiquidClient(network="testnet")
+        client._info = MagicMock()
+        client._info.candles_snapshot = MagicMock(return_value=[])
+        with pytest.raises(ExchangeError, match="No UTC 00:00 candle"):
+            await client._get_utc_day_open_price("BTC")
+
+    @pytest.mark.asyncio
+    async def test_sdk_error_propagates(self) -> None:
+        client = HyperLiquidClient(network="testnet")
+        client._info = MagicMock()
+        client._info.candles_snapshot = MagicMock(
+            side_effect=Exception("network error")
+        )
+        with pytest.raises(ExchangeError, match="Failed to fetch UTC open"):
+            await client._get_utc_day_open_price("BTC")
+
+
+# ────────────────────────────────────────────────
+# _estimate_flow_from_book
+# ────────────────────────────────────────────────
+
+
+class TestEstimateFlowFromBook:
+    @pytest.mark.asyncio
+    async def test_calculates_top5_notional(self) -> None:
+        client = HyperLiquidClient(network="testnet")
+        client._info = MagicMock()
+        client._info.l2_snapshot = MagicMock(
+            return_value={
+                "levels": [
+                    [  # bids
+                        {"px": "100", "sz": "1", "n": 1},
+                        {"px": "99", "sz": "2", "n": 1},
+                        {"px": "98", "sz": "1", "n": 1},
+                        {"px": "97", "sz": "1", "n": 1},
+                        {"px": "96", "sz": "1", "n": 1},
+                        {"px": "95", "sz": "100", "n": 1},  # top5外
+                    ],
+                    [  # asks
+                        {"px": "101", "sz": "2", "n": 1},
+                        {"px": "102", "sz": "1", "n": 1},
+                        {"px": "103", "sz": "1", "n": 1},
+                        {"px": "104", "sz": "1", "n": 1},
+                        {"px": "105", "sz": "1", "n": 1},
+                        {"px": "106", "sz": "100", "n": 1},
+                    ],
+                ],
+                "time": 0,
+            }
+        )
+        buy_usd, sell_usd = await client._estimate_flow_from_book("BTC")
+        # bids: 100 + 198 + 98 + 97 + 96 = 589
+        # asks: 202 + 102 + 103 + 104 + 105 = 616
+        assert buy_usd == Decimal("589")
+        assert sell_usd == Decimal("616")
+
+    @pytest.mark.asyncio
+    async def test_book_error_returns_zeros(self) -> None:
+        # 板取得失敗時は (0, 0) を返し snapshot 構築を継続。
+        client = HyperLiquidClient(network="testnet")
+        client._info = MagicMock()
+        client._info.l2_snapshot = MagicMock(side_effect=Exception("error"))
+        buy, sell = await client._estimate_flow_from_book("BTC")
+        assert buy == Decimal("0")
+        assert sell == Decimal("0")
+
+
+# ────────────────────────────────────────────────
+# get_market_snapshot 統合（mock）
+# ────────────────────────────────────────────────
+
+
+def _make_meta_response(symbol: str = "BTC", **ctx_overrides: object) -> list[object]:
+    ctx = {
+        "markPx": "65500",
+        "dayHigh": "66000",
+        "dayLow": "64000",
+        "dayNtlVlm": "100000000",
+        "dayBaseVlm": "1500",
+        "prevDayPx": "65000",
+        "funding": "0.00001",
+        "openInterest": "12345",
+    }
+    ctx.update(ctx_overrides)  # type: ignore[arg-type]
+    return [
+        {"universe": [{"name": symbol, "szDecimals": 5, "maxLeverage": 50}]},
+        [ctx],
+    ]
+
+
+def _make_5m_candles(count: int = 21) -> list[dict[str, object]]:
+    return [
+        {
+            "t": i * 300_000,
+            "o": "65000",
+            "h": "65100",
+            "l": "64900",
+            "c": str(65000 + i * 10),
+            "v": "10",
+        }
+        for i in range(count)
+    ]
+
+
+class TestGetMarketSnapshot:
+    @pytest.mark.asyncio
+    async def test_builds_complete_snapshot(self) -> None:
+        client = HyperLiquidClient(network="testnet")
+        client._info = MagicMock()
+        client._info.meta_and_asset_ctxs = MagicMock(return_value=_make_meta_response())
+
+        five_m = _make_5m_candles(21)
+        utc_open_candles = [{"t": 0, "o": "65000", "c": "65100", "v": "100"}]
+
+        def candles_side_effect(
+            name: str, interval: str, start: int, end: int
+        ) -> list[dict[str, object]]:
+            if interval == "5m":
+                return five_m
+            if interval == "1h":
+                return utc_open_candles
+            return []
+
+        client._info.candles_snapshot = MagicMock(side_effect=candles_side_effect)
+        client._info.l2_snapshot = MagicMock(
+            return_value={
+                "levels": [
+                    [{"px": "65499", "sz": "1", "n": 1}],
+                    [{"px": "65501", "sz": "1", "n": 1}],
+                ],
+                "time": 0,
+            }
+        )
+
+        snap = await client.get_market_snapshot("BTC")
+
+        assert snap.symbol == "BTC"
+        assert snap.current_price == 65500.0
+        assert snap.high_24h == 66000.0
+        assert snap.low_24h == 64000.0
+        # VWAP = 100,000,000 / 1500 ≒ 66666.67
+        assert snap.vwap == pytest.approx(66666.67, rel=0.01)
+        assert snap.rolling_24h_open == 65000.0
+        assert snap.utc_open_price == 65000.0
+        # momentum_5bar: candle[-6].c=65150, candle[-1].c=65200 → ~0.0768%
+        assert snap.momentum_5bar_pct == pytest.approx(0.0768, rel=0.1)
+        # volume_surge_ratio = 直近10 / 平均10 = 1
+        assert snap.volume_surge_ratio == pytest.approx(1.0, rel=0.01)
+        # funding 1h=0.00001 → 8h=0.00008
+        assert snap.funding_rate == pytest.approx(0.00008, rel=0.01)
+        assert snap.open_interest == 12345.0
+        # WS 未実装
+        assert snap.flow_large_order_count == 0
+        # flow_buy_sell_ratio = 65499/65501 ≒ 0.9999...
+        assert snap.flow_buy_sell_ratio == pytest.approx(1.0, rel=0.01)
+        # sentiment はデフォルト
+        assert snap.sentiment_score == 0.0
+        assert snap.sentiment_confidence == 0.0
+        assert snap.btc_ema_trend == "UPTREND"
+
+    @pytest.mark.asyncio
+    async def test_unknown_symbol_raises(self) -> None:
+        client = HyperLiquidClient(network="testnet")
+        client._info = MagicMock()
+        client._info.meta_and_asset_ctxs = MagicMock(return_value=_make_meta_response())
+        with pytest.raises(ExchangeError, match="Symbol not found"):
+            await client.get_market_snapshot("UNKNOWN")
+
+    @pytest.mark.asyncio
+    async def test_insufficient_candles_raises(self) -> None:
+        client = HyperLiquidClient(network="testnet")
+        client._info = MagicMock()
+        client._info.meta_and_asset_ctxs = MagicMock(return_value=_make_meta_response())
+        client._info.candles_snapshot = MagicMock(
+            return_value=[
+                {"t": i, "o": "65000", "h": "65000", "l": "65000", "c": "65000", "v": "10"}
+                for i in range(5)
+            ]
+        )
+        with pytest.raises(ExchangeError, match="Insufficient 5m candles"):
             await client.get_market_snapshot("BTC")
+
+    @pytest.mark.asyncio
+    async def test_zero_volume_avg_falls_back_to_one(self) -> None:
+        # 直近20本平均が0 → volume_surge_ratio はゼロ除算回避で 1
+        client = HyperLiquidClient(network="testnet")
+        client._info = MagicMock()
+        client._info.meta_and_asset_ctxs = MagicMock(return_value=_make_meta_response())
+        candles = [
+            {
+                "t": i * 300_000,
+                "o": "65000",
+                "h": "65100",
+                "l": "64900",
+                "c": str(65000 + i * 10),
+                "v": "0",  # 全部0
+            }
+            for i in range(21)
+        ]
+        utc = [{"t": 0, "o": "65000", "c": "65100", "v": "100"}]
+
+        def side(name: str, interval: str, start: int, end: int) -> list[dict[str, object]]:
+            return candles if interval == "5m" else utc
+
+        client._info.candles_snapshot = MagicMock(side_effect=side)
+        client._info.l2_snapshot = MagicMock(
+            return_value={"levels": [[], []], "time": 0}
+        )
+        snap = await client.get_market_snapshot("BTC")
+        assert snap.volume_surge_ratio == 1.0
+
+    @pytest.mark.asyncio
+    async def test_zero_five_bars_ago_close_falls_back_to_zero(self) -> None:
+        # 5本前の close が 0 のとき momentum_5bar_pct はゼロ除算回避で 0
+        client = HyperLiquidClient(network="testnet")
+        client._info = MagicMock()
+        client._info.meta_and_asset_ctxs = MagicMock(return_value=_make_meta_response())
+        candles = [
+            {"t": i * 300_000, "o": "0", "h": "0", "l": "0", "c": "0", "v": "10"}
+            for i in range(21)
+        ]
+        utc = [{"t": 0, "o": "65000", "c": "65100", "v": "100"}]
+
+        def side(name: str, interval: str, start: int, end: int) -> list[dict[str, object]]:
+            return candles if interval == "5m" else utc
+
+        client._info.candles_snapshot = MagicMock(side_effect=side)
+        client._info.l2_snapshot = MagicMock(
+            return_value={"levels": [[], []], "time": 0}
+        )
+        snap = await client.get_market_snapshot("BTC")
+        assert snap.momentum_5bar_pct == 0.0
+
+    @pytest.mark.asyncio
+    async def test_zero_sell_flow_falls_back_to_one(self) -> None:
+        # 板の ask 側が空 → flow_buy_sell_ratio はゼロ除算回避で 1
+        client = HyperLiquidClient(network="testnet")
+        client._info = MagicMock()
+        client._info.meta_and_asset_ctxs = MagicMock(return_value=_make_meta_response())
+        five_m = _make_5m_candles(21)
+        utc = [{"t": 0, "o": "65000", "c": "65100", "v": "100"}]
+
+        def side(name: str, interval: str, start: int, end: int) -> list[dict[str, object]]:
+            return five_m if interval == "5m" else utc
+
+        client._info.candles_snapshot = MagicMock(side_effect=side)
+        client._info.l2_snapshot = MagicMock(
+            return_value={
+                "levels": [
+                    [{"px": "65499", "sz": "1", "n": 1}],
+                    [],  # ask 側空
+                ],
+                "time": 0,
+            }
+        )
+        snap = await client.get_market_snapshot("BTC")
+        assert snap.flow_buy_sell_ratio == 1.0
 
 
 # ────────────────────────────────────────────────
@@ -398,3 +700,18 @@ class TestE2ETestnet:
         client = HyperLiquidClient(network="testnet")
         oi = await client.get_open_interest("BTC")
         assert oi > 0
+
+    @pytest.mark.asyncio
+    async def test_market_snapshot_btc(self) -> None:
+        client = HyperLiquidClient(network="testnet")
+        snap = await client.get_market_snapshot("BTC")
+        assert snap.symbol == "BTC"
+        assert snap.current_price > 0
+        assert snap.vwap > 0
+        assert snap.high_24h >= snap.low_24h
+        assert snap.utc_open_price > 0
+        assert snap.rolling_24h_open > 0
+        assert snap.open_interest > 0
+        # APPLICATION 層で上書きされる前提のデフォルト
+        assert snap.sentiment_score == 0.0
+        assert snap.btc_ema_trend == "UPTREND"
