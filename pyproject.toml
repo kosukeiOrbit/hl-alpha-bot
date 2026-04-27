@@ -3,7 +3,7 @@
 # Trading parameters live in config/settings.yaml (see docs/design.md ch.23).
 
 [tool.pytest.ini_options]
-addopts = "-v --cov=src --cov-report=term-missing"
+addopts = "-v --cov=src --cov-report=term-missing --cov-fail-under=100"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
@@ -11,22 +11,67 @@ markers = [
     "slow: 時間のかかるテスト",
 ]
 
+# ─── ruff: linter + formatter ──────────────────────────
 [tool.ruff]
 line-length = 100
 target-version = "py313"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "B", "UP"]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "C90",  # mccabe complexity
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501", # formatter が長さは扱う
+]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "N802", # 大文字を含むテストメソッド名を許容
+    "N803", # fixture 由来の大文字引数名を許容
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+# ─── mypy: strict type checking on src/ ────────────────
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+[[tool.mypy.overrides]]
+module = "hypothesis.*"
+ignore_missing_imports = true
+
+# ─── black: kept for backward compatibility ────────────
+# 通常は ruff format を使う。black は必要時のみ。
 [tool.black]
 line-length = 100
 target-version = ["py313"]
 
-[tool.mypy]
-python_version = "3.13"
-strict = true
-exclude = ["tests/", "scripts/"]
-
+# ─── coverage ──────────────────────────────────────────
 [tool.coverage.run]
 source = ["src"]
 branch = true
