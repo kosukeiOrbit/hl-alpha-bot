@@ -4,6 +4,7 @@
 パラメトリックで境界値を網羅 +
 プロパティベースで全域定義性を確認。
 """
+
 from __future__ import annotations
 
 import pytest
@@ -12,7 +13,6 @@ from hypothesis import strategies as st
 
 from src.core.entry_judge import judge_long_entry, judge_short_entry
 from tests.core.helpers import make_short_snapshot, make_snapshot
-
 
 # ────────────────────────────────────────────────
 # LONG: 全層通過と各層単独失敗
@@ -112,9 +112,7 @@ class TestLongSentimentLayer:
         assert decision.rejection_reason == "layer_sentiment_failed"
 
     def test_rejected_when_has_regulation(self) -> None:
-        decision = judge_long_entry(
-            make_snapshot(sentiment_flags={"has_regulation": True})
-        )
+        decision = judge_long_entry(make_snapshot(sentiment_flags={"has_regulation": True}))
         assert decision.rejection_reason == "layer_sentiment_failed"
 
 
@@ -214,9 +212,7 @@ class TestShortAllPass:
 
 class TestShortIndividualLayers:
     def test_rejected_when_above_vwap(self) -> None:
-        decision = judge_short_entry(
-            make_short_snapshot(current_price=100.5, vwap=100.0)
-        )
+        decision = judge_short_entry(make_short_snapshot(current_price=100.5, vwap=100.0))
         assert decision.rejection_reason == "layer_momentum_failed"
 
     def test_rejected_when_low_downside_momentum(self) -> None:

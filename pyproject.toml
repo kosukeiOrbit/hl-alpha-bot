@@ -30,7 +30,9 @@ select = [
     "RUF",  # ruff-specific
 ]
 ignore = [
-    "E501", # formatter が長さは扱う
+    "E501",   # formatter が長さは扱う
+    "RUF002", # 日本語ドキュメントの全角括弧 「（）」 を許容
+    "RUF003", # 同上（コメント内）
 ]
 
 [tool.ruff.lint.per-file-ignores]

@@ -11,6 +11,7 @@
 としている。SENTIMENT を最後にするのは「有料APIを最後に呼ぶ」という
 APPLICATION層側のコスト最適化と意味論を揃えるため。
 """
+
 from __future__ import annotations
 
 from src.core.models import EntryDecision, MarketSnapshot
@@ -155,8 +156,7 @@ def _check_flow_short(snap: MarketSnapshot) -> bool:
 def _check_regime_short(snap: MarketSnapshot) -> bool:
     """章4 ④ REGIME（SHORT）。BTC下降 OR Funding買い過熱、かつ OI 過熱なし。"""
     btc_or_funding_bearish = (
-        snap.btc_ema_trend != "UPTREND"
-        or snap.funding_rate > _SHORT_FUNDING_RATE_OVERHEATED
+        snap.btc_ema_trend != "UPTREND" or snap.funding_rate > _SHORT_FUNDING_RATE_OVERHEATED
     )
     return btc_or_funding_bearish and abs(snap.oi_change_1h_pct) < _LONG_OI_CHANGE_MAX_PCT
 

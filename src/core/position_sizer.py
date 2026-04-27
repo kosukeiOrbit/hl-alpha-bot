@@ -3,6 +3,7 @@
 口座残高・レバレッジ・連敗状況からポジションサイズを計算する純関数群。
 すべて Decimal で扱う（HL の szDecimals 精度に従って丸めるため）。
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -42,9 +43,7 @@ def calculate_position_size(input: SizingInput) -> SizingResult:
     4. szDecimals で切り捨て（オーバーポジション回避）
     5. 切り捨てで 0 になった場合は rejected
     """
-    size_multiplier = (
-        Decimal("0.5") if input.consecutive_losses >= 3 else Decimal("1.0")
-    )
+    size_multiplier = Decimal("0.5") if input.consecutive_losses >= 3 else Decimal("1.0")
 
     notional = (
         input.account_balance_usd

@@ -8,6 +8,7 @@
 純関数で I/O 一切なし（章11.1）。
 閾値は将来 config から注入予定（章23）。現状はハードコード。
 """
+
 from __future__ import annotations
 
 from src.core.models import MarketSnapshot

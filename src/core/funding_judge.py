@@ -3,6 +3,7 @@
 HyperLiquid は 1 時間ごとに Funding 精算（章22.6）。
 精算前に支払い側で含み益が薄い場合は手仕舞いする。
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -37,9 +38,8 @@ def should_exit_before_funding(input: FundingExitInput) -> bool:
 
     # LONG + funding > 0 → LONG が支払い
     # SHORT + funding < 0 → SHORT が支払い
-    is_paying_funding = (
-        (input.direction == "LONG" and input.funding_rate > 0)
-        or (input.direction == "SHORT" and input.funding_rate < 0)
+    is_paying_funding = (input.direction == "LONG" and input.funding_rate > 0) or (
+        input.direction == "SHORT" and input.funding_rate < 0
     )
     if not is_paying_funding:
         return False

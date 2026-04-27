@@ -3,12 +3,12 @@
 make_snapshot() は「全フィールドにデフォルト値を持つMarketSnapshot生成」用。
 テストでは変えたい部分だけ overrides で指定する。
 """
+
 from __future__ import annotations
 
 from typing import Any
 
 from src.core.models import MarketSnapshot
-
 
 # デフォルトは「LONGエントリーが全層通過する」値にしておく。
 # 各テストは「どの値を崩すと落ちるか」を verify する形になる。

@@ -5,8 +5,10 @@
 - vwap_state_to_record の dict 変換
 - property-based で全域定義性
 """
+
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from decimal import Decimal
 
 import pytest
@@ -19,7 +21,6 @@ from src.core.vwap import (
     update_vwap_state,
     vwap_state_to_record,
 )
-
 
 # ────────────────────────────────────────────────
 # A. calculate_vwap_from_volume
@@ -207,7 +208,7 @@ class TestVWAPStateAccumulation:
 
     def test_frozen_dataclass_rejects_attribute_assignment(self) -> None:
         state = VWAPState()
-        with pytest.raises(Exception):
+        with pytest.raises(FrozenInstanceError):
             state.cross_count = 99  # type: ignore[misc]
 
     def test_above_below_sum_equals_total_elapsed(self) -> None:
@@ -288,9 +289,7 @@ class TestPropertyBased:
         ),
         elapsed=st.integers(min_value=0, max_value=86400),
     )
-    def test_first_update_invariants(
-        self, current_price: float, vwap: float, elapsed: int
-    ) -> None:
+    def test_first_update_invariants(self, current_price: float, vwap: float, elapsed: int) -> None:
         # 初回updateの不変条件: above + below == elapsed, cross_count == 0。
         state = VWAPState()
         new = update_vwap_state(state, current_price, vwap, elapsed)

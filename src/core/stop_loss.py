@@ -4,6 +4,7 @@ ATR ベースで損切り・利確価格を計算する純関数。
 HL API の tick_size に合わせて丸め、最低 1tick 差を保証する
 （auto-daytrade 4/17 の既知の罠回避）。
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass

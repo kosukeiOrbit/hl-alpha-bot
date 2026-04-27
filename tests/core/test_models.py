@@ -3,11 +3,13 @@
 設計書 11.4 の MarketSnapshot に定義されたプロパティが、
 章5 PriceContext と同じ意味の値を返すかを検証する。
 """
+
 from __future__ import annotations
+
+from dataclasses import FrozenInstanceError
 
 import pytest
 
-from src.core.models import MarketSnapshot
 from tests.core.helpers import make_snapshot
 
 
@@ -91,7 +93,7 @@ class TestImmutability:
     def test_market_snapshot_is_frozen(self) -> None:
         # CORE層DTOはfrozen（章11.1 原則1: 不変・純関数指向）。
         snap = make_snapshot()
-        with pytest.raises(Exception):
+        with pytest.raises(FrozenInstanceError):
             snap.current_price = 999.0  # type: ignore[misc]
 
 

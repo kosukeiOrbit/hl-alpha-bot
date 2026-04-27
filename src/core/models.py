@@ -4,10 +4,11 @@
 判定に必要な情報を1つのDTOに集約する。
 ここに I/O や副作用は一切持たせない（章11.1 原則1）。
 """
+
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Mapping
 
 
 @dataclass(frozen=True)
@@ -93,11 +94,7 @@ class MarketSnapshot:
         """1時間前からのOI変化率(%)・章13.5 レジーム判定用。"""
         if self.open_interest_1h_ago == 0:
             return 0.0
-        return (
-            (self.open_interest - self.open_interest_1h_ago)
-            / self.open_interest_1h_ago
-            * 100
-        )
+        return (self.open_interest - self.open_interest_1h_ago) / self.open_interest_1h_ago * 100
 
 
 @dataclass(frozen=True)

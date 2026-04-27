@@ -2,6 +2,7 @@
 
 3基準それぞれの境界値 + AND条件 + LONG/SHORT対称性 + property-based。
 """
+
 from __future__ import annotations
 
 import pytest
@@ -10,7 +11,6 @@ from hypothesis import strategies as st
 
 from src.core.price_context import is_not_overheated_long, is_not_overheated_short
 from tests.core.helpers import make_snapshot
-
 
 # ────────────────────────────────────────────────
 # A. LONG 各基準の境界値
@@ -76,9 +76,7 @@ class TestLongOverheatedFilter:
             (1.0, False),
         ],
     )
-    def test_position_in_24h_range_threshold(
-        self, range_pos: float, expected: bool
-    ) -> None:
+    def test_position_in_24h_range_threshold(self, range_pos: float, expected: bool) -> None:
         low = 100.0
         high = 110.0
         current = low + (high - low) * range_pos
@@ -154,9 +152,7 @@ class TestShortOverheatedFilter:
             (0.05, True),  # 上昇方向は SHORT 過熱判定では通過
         ],
     )
-    def test_utc_day_change_threshold_short(
-        self, utc_change: float, expected: bool
-    ) -> None:
+    def test_utc_day_change_threshold_short(self, utc_change: float, expected: bool) -> None:
         snap = make_snapshot(
             utc_open_price=100.0,
             current_price=100.0 * (1 + utc_change),
@@ -177,9 +173,7 @@ class TestShortOverheatedFilter:
             (0.10, True),  # 上昇でSHORT過熱判定は通過
         ],
     )
-    def test_rolling_24h_change_threshold_short(
-        self, change_24h: float, expected: bool
-    ) -> None:
+    def test_rolling_24h_change_threshold_short(self, change_24h: float, expected: bool) -> None:
         snap = make_snapshot(
             rolling_24h_open=100.0,
             current_price=100.0 * (1 + change_24h),
@@ -200,9 +194,7 @@ class TestShortOverheatedFilter:
             (1.0, True),
         ],
     )
-    def test_position_in_24h_range_threshold_short(
-        self, range_pos: float, expected: bool
-    ) -> None:
+    def test_position_in_24h_range_threshold_short(self, range_pos: float, expected: bool) -> None:
         low = 100.0
         high = 110.0
         current = low + (high - low) * range_pos

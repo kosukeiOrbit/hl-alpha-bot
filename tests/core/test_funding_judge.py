@@ -1,4 +1,5 @@
 """core/funding_judge のテスト（章13.4・章11.7-11.8）。"""
+
 from __future__ import annotations
 
 from decimal import Decimal
@@ -8,7 +9,6 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from src.core.funding_judge import FundingExitInput, should_exit_before_funding
-
 
 # ────────────────────────────────────────────────
 # A. 時間ゲート
@@ -228,9 +228,7 @@ class TestPropertyBased:
         ),
         minutes=st.integers(min_value=0, max_value=60),
     )
-    def test_total_function(
-        self, funding_rate: Decimal, unrealized: Decimal, minutes: int
-    ) -> None:
+    def test_total_function(self, funding_rate: Decimal, unrealized: Decimal, minutes: int) -> None:
         result = should_exit_before_funding(
             FundingExitInput(
                 direction="LONG",
@@ -252,9 +250,7 @@ class TestPropertyBased:
         ),
         minutes=st.integers(min_value=10, max_value=60),
     )
-    def test_far_from_funding_always_holds(
-        self, funding_rate: Decimal, minutes: int
-    ) -> None:
+    def test_far_from_funding_always_holds(self, funding_rate: Decimal, minutes: int) -> None:
         # threshold=5 よりずっと先の精算なら、他の条件によらず False。
         result = should_exit_before_funding(
             FundingExitInput(

@@ -1,10 +1,13 @@
 """core/position_sizer のテスト（章13.2・章11.7）。"""
+
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from decimal import Decimal
 
-from src.core.position_sizer import SizingInput, calculate_position_size
+import pytest
 
+from src.core.position_sizer import SizingInput, calculate_position_size
 
 # ────────────────────────────────────────────────
 # A. 基本動作
@@ -250,8 +253,6 @@ class TestRejection:
 
 class TestImmutability:
     def test_input_dataclass_is_frozen(self) -> None:
-        import pytest
-
         x = SizingInput(
             account_balance_usd=Decimal("1000"),
             entry_price=Decimal("100"),
@@ -260,5 +261,5 @@ class TestImmutability:
             position_size_pct=Decimal("0.10"),
             sz_decimals=2,
         )
-        with pytest.raises(Exception):
+        with pytest.raises(FrozenInstanceError):
             x.account_balance_usd = Decimal("0")  # type: ignore[misc]

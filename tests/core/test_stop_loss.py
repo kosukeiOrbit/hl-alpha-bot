@@ -1,4 +1,5 @@
 """core/stop_loss のテスト（章13.3・章11.7）。"""
+
 from __future__ import annotations
 
 from decimal import Decimal
@@ -6,7 +7,6 @@ from decimal import Decimal
 import pytest
 
 from src.core.stop_loss import StopLossInput, calculate_sl_tp
-
 
 # ────────────────────────────────────────────────
 # A. LONG 基本

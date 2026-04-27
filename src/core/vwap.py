@@ -7,6 +7,7 @@
 
 純関数のみ・I/O一切なし（章11.1）。
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -91,13 +92,9 @@ def vwap_state_to_record(state: VWAPState) -> dict[str, Any]:
         "vwap_cross_count": state.cross_count,
         "vwap_held_above_pct": state.above_seconds / total if total > 0 else 0,
         "min_vwap_distance_pct": (
-            state.min_distance_pct
-            if state.min_distance_pct != float("inf")
-            else None
+            state.min_distance_pct if state.min_distance_pct != float("inf") else None
         ),
         "max_vwap_distance_pct": (
-            state.max_distance_pct
-            if state.max_distance_pct != float("-inf")
-            else None
+            state.max_distance_pct if state.max_distance_pct != float("-inf") else None
         ),
     }
