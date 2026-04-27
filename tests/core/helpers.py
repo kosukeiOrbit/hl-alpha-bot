@@ -1,0 +1,40 @@
+"""CORE層テスト用ヘルパー（設計書 11.7）。
+
+make_snapshot() は「全フィールドにデフォルト値を持つMarketSnapshot生成」用。
+テストでは変えたい部分だけ overrides で指定する。
+"""
+from __future__ import annotations
+
+from typing import Any
+
+from src.core.models import MarketSnapshot
+
+
+# デフォルトは「LONGエントリーが全層通過する」値にしておく。
+# 各テストは「どの値を崩すと落ちるか」を verify する形になる。
+_DEFAULTS: dict[str, Any] = dict(
+    symbol="BTC",
+    current_price=100.2,  # vwap +0.2%
+    vwap=100.0,
+    momentum_5bar_pct=0.5,  # > 0.3
+    utc_open_price=98.0,  # +2.2% (< +5%)
+    rolling_24h_open=95.0,  # +5.5% (< +10%)
+    high_24h=101.0,
+    low_24h=96.0,  # position ≒ 0.84 → 全層通過させるため少し下げる
+    flow_buy_sell_ratio=2.0,  # > 1.5
+    flow_large_order_count=3,
+    volume_surge_ratio=1.8,  # > 1.5
+    sentiment_score=0.7,  # > 0.6
+    sentiment_confidence=0.8,  # > 0.7
+    sentiment_flags={"has_hack": False, "has_regulation": False},
+    btc_ema_trend="UPTREND",
+    btc_atr_pct=2.0,
+    funding_rate=0.005,  # < 0.01
+    open_interest=1_000_000,
+    open_interest_1h_ago=990_000,  # +1% (< 10%)
+)
+
+
+def make_snapshot(**overrides: Any) -> MarketSnapshot:
+    """全層クリア（LONG）のスナップショットを生成し、上書きを適用する。"""
+    return MarketSnapshot(**{**_DEFAULTS, **overrides})
