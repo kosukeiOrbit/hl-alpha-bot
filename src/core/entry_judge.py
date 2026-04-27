@@ -14,14 +14,13 @@ APPLICATION層側のコスト最適化と意味論を揃えるため。
 from __future__ import annotations
 
 from src.core.models import EntryDecision, MarketSnapshot
+from src.core.price_context import is_not_overheated_long, is_not_overheated_short
 
 # ───────────────────────────────────────────────
-# LONG 閾値（章4・章5・章7）
+# LONG 閾値（章4・章7）
+# 章5の3重チェック過熱フィルターは price_context に分離。
 # ───────────────────────────────────────────────
 _LONG_VWAP_MAX_DISTANCE_PCT = 0.5
-_LONG_UTC_DAY_CHANGE_MAX = 0.05  # 章5: UTC始値+5%以内
-_LONG_24H_CHANGE_MAX = 0.10  # 章5: 24h前から+10%以内
-_LONG_RANGE_POSITION_MAX = 0.85  # 章5: 24h高値圏(85%)以下
 _LONG_MOMENTUM_5BAR_MIN_PCT = 0.3  # 5本前比+0.3%以上
 
 _LONG_FLOW_BUY_SELL_RATIO_MIN = 1.5
@@ -35,12 +34,10 @@ _LONG_BTC_ATR_PCT_MAX = 5.0  # 章4: BTC ATR%が極端に高くない
 _LONG_OI_CHANGE_MAX_PCT = 10.0  # 章4: OI 1h変化 ±10%以下
 
 # ───────────────────────────────────────────────
-# SHORT 閾値（章4・章5・章7・LONGと対称）
+# SHORT 閾値（章4・章7・LONGと対称）
+# 章5の過熱フィルターは price_context.is_not_overheated_short に分離。
 # ───────────────────────────────────────────────
 _SHORT_VWAP_MIN_DISTANCE_PCT = -0.5
-_SHORT_UTC_DAY_CHANGE_MIN = -0.05
-_SHORT_24H_CHANGE_MIN = -0.10
-_SHORT_RANGE_POSITION_MIN = 0.15
 _SHORT_MOMENTUM_5BAR_MAX_PCT = -0.3
 
 # 章4: 売り約定優勢。buy/sell 比が 1/1.5 以下なら sell/buy ≥ 1.5。
@@ -87,12 +84,13 @@ def judge_short_entry(snap: MarketSnapshot) -> EntryDecision:
 
 
 def _check_momentum_long(snap: MarketSnapshot) -> bool:
-    """章4 ① MOMENTUM + POSITION（LONG）+ 章5 過熱フィルター。"""
+    """章4 ① MOMENTUM + POSITION（LONG）。
+
+    過熱フィルター（章5）は price_context.is_not_overheated_long に委譲。
+    """
     return (
         0 < snap.vwap_distance_pct < _LONG_VWAP_MAX_DISTANCE_PCT
-        and snap.utc_day_change_pct < _LONG_UTC_DAY_CHANGE_MAX
-        and snap.rolling_24h_change_pct < _LONG_24H_CHANGE_MAX
-        and snap.position_in_24h_range < _LONG_RANGE_POSITION_MAX
+        and is_not_overheated_long(snap)
         and snap.momentum_5bar_pct > _LONG_MOMENTUM_5BAR_MIN_PCT
     )
 
@@ -131,12 +129,13 @@ def _check_sentiment_long(snap: MarketSnapshot) -> bool:
 
 
 def _check_momentum_short(snap: MarketSnapshot) -> bool:
-    """章4 ① MOMENTUM + POSITION（SHORT・LONGと対称）。"""
+    """章4 ① MOMENTUM + POSITION（SHORT・LONGと対称）。
+
+    過熱フィルター（章5）は price_context.is_not_overheated_short に委譲。
+    """
     return (
         _SHORT_VWAP_MIN_DISTANCE_PCT < snap.vwap_distance_pct < 0
-        and snap.utc_day_change_pct > _SHORT_UTC_DAY_CHANGE_MIN
-        and snap.rolling_24h_change_pct > _SHORT_24H_CHANGE_MIN
-        and snap.position_in_24h_range > _SHORT_RANGE_POSITION_MIN
+        and is_not_overheated_short(snap)
         and snap.momentum_5bar_pct < _SHORT_MOMENTUM_5BAR_MAX_PCT
     )
 
