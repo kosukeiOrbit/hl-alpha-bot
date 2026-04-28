@@ -6,6 +6,7 @@ hypothesis>=6.92.0
 ruff>=0.4.0
 black>=24.0.0
 mypy>=1.8.0
+types-PyYAML>=6.0
 pre-commit>=3.6.0
 # Agent Wallet 生成（scripts/generate_agent_wallet.py）
 eth-account>=0.13
