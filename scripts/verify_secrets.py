@@ -19,10 +19,14 @@ import asyncio
 import re
 import subprocess
 import sys
+from pathlib import Path
 from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ValidationError, field_validator
+
+# scripts/ を直接実行するときに src パッケージを import 可能にする。
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 _ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 _PRIVATE_KEY_RE = re.compile(r"^0x[a-fA-F0-9]{64}$")
