@@ -12,9 +12,9 @@
   get_order_by_client_id)
 - cancel_order / Exchange 初期化 (PR6.4.1)
 - place_order (PR6.4.2)
+- place_trigger_order / place_orders_grouped (PR6.4.3)
 
-未実装（後続PR）:
-- place_trigger_order / place_orders_grouped（PR6.4.3）
+ExchangeProtocol は本実装で 100% カバー。
 """
 
 from __future__ import annotations
@@ -45,6 +45,7 @@ from src.adapters.exchange import (
     Position,
     RateLimitError,
     SymbolMeta,
+    TriggerOrderRequest,
 )
 from src.core.models import MarketSnapshot
 from src.core.vwap import calculate_vwap_from_volume
@@ -792,6 +793,196 @@ class HyperLiquidClient:
         if "duplicate" in lowered or "already" in lowered:
             raise DuplicateOrderError(error_msg)
         raise OrderRejectedError(error_msg)
+
+    # ─── Trigger order / grouped order（PR6.4.3・章14.5/14.6・章22.4） ───
+
+    async def place_trigger_order(
+        self, request: TriggerOrderRequest
+    ) -> OrderResult:
+        """TP/SL 単発の trigger order を発注（章22.4・章14.5）。
+
+        Raises:
+            OrderRejectedError: 拒否（ALO 含む）。
+            DuplicateOrderError: cloid 重複。
+            RateLimitError: レート制限。
+            ExchangeError: address / agent_private_key 未設定、limit_price
+                指定漏れ、SDK 通信エラー等。
+        """
+        self._require_address()
+        if self.agent_private_key is None:
+            raise ExchangeError(
+                "agent_private_key is required for place_trigger_order"
+            )
+        if not request.is_market and request.limit_price is None:
+            raise ExchangeError("limit_price is required when is_market=False")
+
+        order_type = self._build_trigger_order_type(request)
+        is_buy = request.side == "buy"
+        # is_market=True でも HL は limit_px を要求するので trigger_price で代用。
+        limit_px_decimal = (
+            request.limit_price
+            if request.limit_price is not None
+            else request.trigger_price
+        )
+        cloid_obj = Cloid.from_str(_generate_cloid())
+
+        try:
+            response = await asyncio.to_thread(
+                self.exchange.order,
+                request.symbol,
+                is_buy,
+                float(request.size),
+                float(limit_px_decimal),
+                order_type,
+                request.reduce_only,
+                cloid_obj,
+            )
+        except Exception as e:
+            raise ExchangeError(
+                f"Failed to place trigger order for {request.symbol}: {e}"
+            ) from e
+
+        return self._parse_order_response(response)
+
+    @staticmethod
+    def _build_trigger_order_type(
+        request: TriggerOrderRequest,
+    ) -> dict[str, dict[str, Any]]:
+        """TriggerOrderRequest を SDK の order_type dict に変換（章22.4）。
+
+        SDK 形式:
+        {"trigger": {"isMarket": bool, "triggerPx": str, "tpsl": "tp"|"sl"}}
+        """
+        if request.tpsl not in ("tp", "sl"):
+            raise ExchangeError(f"Invalid tpsl: {request.tpsl}")
+        return {
+            "trigger": {
+                "isMarket": request.is_market,
+                "triggerPx": str(request.trigger_price),
+                "tpsl": request.tpsl,
+            }
+        }
+
+    async def place_orders_grouped(
+        self,
+        entry: OrderRequest,
+        tp: TriggerOrderRequest | None,
+        sl: TriggerOrderRequest | None,
+    ) -> tuple[OrderResult, ...]:
+        """エントリー + TP + SL を normalTpsl で連結発注（章14.6）。
+
+        エントリーが約定すると HL 側で自動的に TP/SL が active 化する。
+        部分成功あり: 個別失敗は OrderResult(success=False, rejected_reason=...)
+        として返し、全体を例外にはしない。トップレベル err のみ例外化。
+        """
+        self._require_address()
+        if self.agent_private_key is None:
+            raise ExchangeError(
+                "agent_private_key is required for place_orders_grouped"
+            )
+        if tp is None and sl is None:
+            raise ExchangeError(
+                "At least one of tp or sl must be provided. "
+                "Use place_order() if you don't need TP/SL grouping."
+            )
+
+        sdk_orders = self._build_grouped_orders(entry, tp, sl)
+        try:
+            response = await asyncio.to_thread(
+                self.exchange.bulk_orders,
+                sdk_orders,
+                grouping="normalTpsl",
+            )
+        except Exception as e:
+            raise ExchangeError(f"Failed to place grouped orders: {e}") from e
+
+        return self._parse_grouped_response(response)
+
+    def _build_grouped_orders(
+        self,
+        entry: OrderRequest,
+        tp: TriggerOrderRequest | None,
+        sl: TriggerOrderRequest | None,
+    ) -> list[dict[str, Any]]:
+        """bulk_orders に渡す SDK OrderRequest dict のリストを構築。"""
+        orders: list[dict[str, Any]] = [self._entry_to_sdk_dict(entry)]
+        if tp is not None:
+            orders.append(self._trigger_to_sdk_dict(tp))
+        if sl is not None:
+            orders.append(self._trigger_to_sdk_dict(sl))
+        return orders
+
+    def _entry_to_sdk_dict(self, entry: OrderRequest) -> dict[str, Any]:
+        cloid_str = entry.client_order_id or _generate_cloid()
+        return {
+            "coin": entry.symbol,
+            "is_buy": entry.side == "buy",
+            "sz": float(entry.size),
+            "limit_px": float(entry.price),
+            "order_type": self._build_order_type(entry.tif),
+            "reduce_only": entry.reduce_only,
+            "cloid": Cloid.from_str(cloid_str),
+        }
+
+    def _trigger_to_sdk_dict(
+        self, trigger: TriggerOrderRequest
+    ) -> dict[str, Any]:
+        limit_px_decimal = (
+            trigger.limit_price
+            if trigger.limit_price is not None
+            else trigger.trigger_price
+        )
+        return {
+            "coin": trigger.symbol,
+            "is_buy": trigger.side == "buy",
+            "sz": float(trigger.size),
+            "limit_px": float(limit_px_decimal),
+            "order_type": self._build_trigger_order_type(trigger),
+            "reduce_only": trigger.reduce_only,
+            "cloid": Cloid.from_str(_generate_cloid()),
+        }
+
+    @staticmethod
+    def _parse_grouped_response(
+        response: dict[str, Any],
+    ) -> tuple[OrderResult, ...]:
+        """bulk_orders レスポンスをパース。個別失敗は OrderResult として保持。"""
+        top_status = response.get("status")
+        if top_status == "err":
+            HyperLiquidClient._raise_top_level_err(response)
+        if top_status != "ok":
+            raise ExchangeError(f"Unknown status: {top_status}")
+
+        statuses = response.get("response", {}).get("data", {}).get("statuses", [])
+        if not statuses:
+            raise ExchangeError(f"No statuses in grouped response: {response}")
+
+        return tuple(
+            HyperLiquidClient._grouped_status_to_result(i, s)
+            for i, s in enumerate(statuses)
+        )
+
+    @staticmethod
+    def _grouped_status_to_result(idx: int, status: Any) -> OrderResult:
+        if isinstance(status, str):
+            return OrderResult(success=True, order_id=None)
+        if not isinstance(status, dict):
+            raise ExchangeError(f"Unexpected status[{idx}] format: {status!r}")
+        if "error" in status:
+            return OrderResult(
+                success=False,
+                order_id=None,
+                rejected_reason=str(status["error"]),
+            )
+        if "resting" in status:
+            return OrderResult(
+                success=True, order_id=int(status["resting"]["oid"])
+            )
+        if "filled" in status:
+            return OrderResult(
+                success=True, order_id=int(status["filled"]["oid"])
+            )
+        raise ExchangeError(f"Unrecognized status[{idx}]: {status!r}")
 
 
 def _generate_cloid() -> str:

@@ -21,6 +21,7 @@ from src.adapters.exchange import (
     OrderRequest,
     RateLimitError,
     SymbolMeta,
+    TriggerOrderRequest,
 )
 from src.infrastructure.hyperliquid_client import (
     HyperLiquidClient,
@@ -1612,6 +1613,460 @@ class TestPlaceOrderAutoGenerateCloid:
 
 
 # ────────────────────────────────────────────────
+# place_trigger_order / place_orders_grouped（PR6.4.3）
+# ────────────────────────────────────────────────
+
+
+def _trigger_request(**overrides: Any) -> TriggerOrderRequest:
+    base: dict[str, Any] = {
+        "symbol": "BTC",
+        "side": "sell",
+        "size": Decimal("0.0002"),
+        "trigger_price": Decimal("70000"),
+        "is_market": True,
+        "limit_price": None,
+        "tpsl": "sl",
+        "reduce_only": True,
+    }
+    base.update(overrides)
+    return TriggerOrderRequest(**base)
+
+
+class TestBuildTriggerOrderType:
+    def test_market_sl(self) -> None:
+        req = _trigger_request()
+        assert HyperLiquidClient._build_trigger_order_type(req) == {
+            "trigger": {
+                "isMarket": True,
+                "triggerPx": "70000",
+                "tpsl": "sl",
+            }
+        }
+
+    def test_limit_tp(self) -> None:
+        req = _trigger_request(
+            tpsl="tp",
+            is_market=False,
+            limit_price=Decimal("80100"),
+            trigger_price=Decimal("80000"),
+        )
+        assert HyperLiquidClient._build_trigger_order_type(req) == {
+            "trigger": {
+                "isMarket": False,
+                "triggerPx": "80000",
+                "tpsl": "tp",
+            }
+        }
+
+    def test_invalid_tpsl_raises(self) -> None:
+        # frozen dataclass の Literal 制約は静的検査だけなので、
+        # 実行時のガードを object.__setattr__ で偽装入力させて確認。
+        req = _trigger_request()
+        object.__setattr__(req, "tpsl", "invalid")
+        with pytest.raises(ExchangeError, match="Invalid tpsl"):
+            HyperLiquidClient._build_trigger_order_type(req)
+
+
+class TestPlaceTriggerOrder:
+    @pytest.mark.asyncio
+    async def test_market_sl_uses_trigger_as_limit_px(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {"statuses": [{"resting": {"oid": 9001}}]},
+                },
+            }
+        )
+        result = await client.place_trigger_order(_trigger_request())
+        assert result.success is True
+        assert result.order_id == 9001
+
+        call_args = client._exchange.order.call_args
+        assert call_args[0][0] == "BTC"
+        assert call_args[0][1] is False  # sell → is_buy=False
+        assert call_args[0][2] == 0.0002
+        assert call_args[0][3] == 70000.0  # market → trigger_price 流用
+        assert call_args[0][4] == {
+            "trigger": {
+                "isMarket": True,
+                "triggerPx": "70000",
+                "tpsl": "sl",
+            }
+        }
+        assert call_args[0][5] is True  # reduce_only
+
+    @pytest.mark.asyncio
+    async def test_limit_tp_uses_limit_price(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {"statuses": [{"resting": {"oid": 1}}]},
+                },
+            }
+        )
+        await client.place_trigger_order(
+            _trigger_request(
+                tpsl="tp",
+                is_market=False,
+                limit_price=Decimal("80100"),
+                trigger_price=Decimal("80000"),
+            )
+        )
+        call_args = client._exchange.order.call_args
+        assert call_args[0][3] == 80100.0  # limit → limit_price
+
+    @pytest.mark.asyncio
+    async def test_buy_side_passes_is_buy_true(self) -> None:
+        # SHORT 側の TP は side=buy。
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {"statuses": [{"resting": {"oid": 1}}]},
+                },
+            }
+        )
+        await client.place_trigger_order(_trigger_request(side="buy"))
+        assert client._exchange.order.call_args[0][1] is True
+
+    @pytest.mark.asyncio
+    async def test_limit_without_limit_price_raises(self) -> None:
+        client = _writeable_client()
+        with pytest.raises(ExchangeError, match="limit_price is required"):
+            await client.place_trigger_order(
+                _trigger_request(is_market=False, limit_price=None)
+            )
+
+    @pytest.mark.asyncio
+    async def test_no_address_raises(self) -> None:
+        client = HyperLiquidClient(
+            network="testnet", address=None, agent_private_key=_TEST_PRIV
+        )
+        with pytest.raises(ExchangeError, match="address is required"):
+            await client.place_trigger_order(_trigger_request())
+
+    @pytest.mark.asyncio
+    async def test_no_private_key_raises(self) -> None:
+        client = HyperLiquidClient(
+            network="testnet", address=_TEST_ADDR, agent_private_key=None
+        )
+        with pytest.raises(ExchangeError, match="agent_private_key is required"):
+            await client.place_trigger_order(_trigger_request())
+
+    @pytest.mark.asyncio
+    async def test_sdk_exception_propagates(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(
+            side_effect=ConnectionError("network down")
+        )
+        with pytest.raises(ExchangeError, match="Failed to place trigger order"):
+            await client.place_trigger_order(_trigger_request())
+
+
+class TestPlaceOrdersGrouped:
+    @pytest.mark.asyncio
+    async def test_entry_with_tp_and_sl(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.bulk_orders = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {
+                        "statuses": [
+                            {"resting": {"oid": 100}},
+                            {"resting": {"oid": 101}},
+                            {"resting": {"oid": 102}},
+                        ]
+                    },
+                },
+            }
+        )
+        entry = _make_request(price=Decimal("65000"), size=Decimal("0.0002"))
+        tp = _trigger_request(
+            tpsl="tp",
+            is_market=False,
+            limit_price=Decimal("67100"),
+            trigger_price=Decimal("67000"),
+        )
+        sl = _trigger_request(trigger_price=Decimal("63000"))
+
+        results = await client.place_orders_grouped(entry, tp, sl)
+        assert tuple(r.order_id for r in results) == (100, 101, 102)
+        assert all(r.success for r in results)
+
+        sdk_orders = client._exchange.bulk_orders.call_args[0][0]
+        assert len(sdk_orders) == 3
+        assert client._exchange.bulk_orders.call_args[1]["grouping"] == "normalTpsl"
+        # entry の dict 構造
+        assert sdk_orders[0]["coin"] == "BTC"
+        assert sdk_orders[0]["is_buy"] is True
+        assert sdk_orders[0]["order_type"] == {"limit": {"tif": "Alo"}}
+        # tp は trigger.tpsl="tp"
+        assert sdk_orders[1]["order_type"]["trigger"]["tpsl"] == "tp"
+        assert sdk_orders[1]["limit_px"] == 67100.0
+        # sl は trigger.tpsl="sl"・market は trigger_price 流用
+        assert sdk_orders[2]["order_type"]["trigger"]["tpsl"] == "sl"
+        assert sdk_orders[2]["limit_px"] == 63000.0
+
+    @pytest.mark.asyncio
+    async def test_entry_with_sl_only(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.bulk_orders = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {
+                        "statuses": [
+                            {"resting": {"oid": 100}},
+                            {"resting": {"oid": 102}},
+                        ]
+                    },
+                },
+            }
+        )
+        entry = _make_request(price=Decimal("65000"), size=Decimal("0.0002"))
+        sl = _trigger_request(trigger_price=Decimal("63000"))
+
+        results = await client.place_orders_grouped(entry, None, sl)
+        assert len(results) == 2
+        assert client._exchange.bulk_orders.call_args[0][0].__len__() == 2
+
+    @pytest.mark.asyncio
+    async def test_entry_with_tp_only(self) -> None:
+        # tp 単独でも分岐を踏ませる。
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.bulk_orders = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {
+                        "statuses": [
+                            {"resting": {"oid": 100}},
+                            {"resting": {"oid": 101}},
+                        ]
+                    },
+                },
+            }
+        )
+        entry = _make_request(price=Decimal("65000"), size=Decimal("0.0002"))
+        tp = _trigger_request(
+            tpsl="tp",
+            is_market=False,
+            limit_price=Decimal("67100"),
+            trigger_price=Decimal("67000"),
+        )
+        results = await client.place_orders_grouped(entry, tp, None)
+        assert len(results) == 2
+
+    @pytest.mark.asyncio
+    async def test_no_tp_no_sl_raises(self) -> None:
+        client = _writeable_client()
+        entry = _make_request()
+        with pytest.raises(ExchangeError, match="At least one of tp or sl"):
+            await client.place_orders_grouped(entry, None, None)
+
+    @pytest.mark.asyncio
+    async def test_partial_failure_returns_mixed_results(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.bulk_orders = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {
+                        "statuses": [
+                            {"resting": {"oid": 100}},
+                            {"error": "Insufficient margin"},
+                            {"resting": {"oid": 102}},
+                        ]
+                    },
+                },
+            }
+        )
+        entry = _make_request(price=Decimal("65000"), size=Decimal("0.0002"))
+        tp = _trigger_request(
+            tpsl="tp",
+            is_market=False,
+            limit_price=Decimal("67100"),
+            trigger_price=Decimal("67000"),
+        )
+        sl = _trigger_request(trigger_price=Decimal("63000"))
+
+        results = await client.place_orders_grouped(entry, tp, sl)
+        assert results[0].success is True
+        assert results[1].success is False
+        assert "Insufficient margin" in (results[1].rejected_reason or "")
+        assert results[2].success is True
+
+    @pytest.mark.asyncio
+    async def test_filled_status_returns_success(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.bulk_orders = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {
+                        "statuses": [
+                            {"filled": {"totalSz": "0.0002", "avgPx": "65000", "oid": 100}},
+                            {"resting": {"oid": 102}},
+                        ]
+                    },
+                },
+            }
+        )
+        entry = _make_request(price=Decimal("65000"), size=Decimal("0.0002"))
+        sl = _trigger_request(trigger_price=Decimal("63000"))
+        results = await client.place_orders_grouped(entry, None, sl)
+        assert results[0].order_id == 100
+        assert results[0].success is True
+
+    @pytest.mark.asyncio
+    async def test_string_status_returns_success_no_oid(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.bulk_orders = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {"statuses": ["success", {"resting": {"oid": 102}}]},
+                },
+            }
+        )
+        entry = _make_request(price=Decimal("65000"), size=Decimal("0.0002"))
+        sl = _trigger_request(trigger_price=Decimal("63000"))
+        results = await client.place_orders_grouped(entry, None, sl)
+        assert results[0].success is True
+        assert results[0].order_id is None
+
+    @pytest.mark.asyncio
+    async def test_top_level_err_rate_limit_raises(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.bulk_orders = MagicMock(
+            return_value={"status": "err", "response": "Too many requests"}
+        )
+        entry = _make_request()
+        sl = _trigger_request(trigger_price=Decimal("63000"))
+        with pytest.raises(RateLimitError):
+            await client.place_orders_grouped(entry, None, sl)
+
+    @pytest.mark.asyncio
+    async def test_unknown_top_status_raises(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.bulk_orders = MagicMock(return_value={"status": "wat"})
+        entry = _make_request()
+        sl = _trigger_request(trigger_price=Decimal("63000"))
+        with pytest.raises(ExchangeError, match="Unknown status"):
+            await client.place_orders_grouped(entry, None, sl)
+
+    @pytest.mark.asyncio
+    async def test_no_statuses_raises(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.bulk_orders = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {"type": "order", "data": {"statuses": []}},
+            }
+        )
+        entry = _make_request()
+        sl = _trigger_request(trigger_price=Decimal("63000"))
+        with pytest.raises(ExchangeError, match="No statuses"):
+            await client.place_orders_grouped(entry, None, sl)
+
+    @pytest.mark.asyncio
+    async def test_unexpected_status_format_raises(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.bulk_orders = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {"statuses": [123, {"resting": {"oid": 1}}]},
+                },
+            }
+        )
+        entry = _make_request()
+        sl = _trigger_request(trigger_price=Decimal("63000"))
+        with pytest.raises(ExchangeError, match="Unexpected status"):
+            await client.place_orders_grouped(entry, None, sl)
+
+    @pytest.mark.asyncio
+    async def test_unrecognized_dict_status_raises(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.bulk_orders = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {"statuses": [{"weird": {}}, {"resting": {"oid": 1}}]},
+                },
+            }
+        )
+        entry = _make_request()
+        sl = _trigger_request(trigger_price=Decimal("63000"))
+        with pytest.raises(ExchangeError, match="Unrecognized status"):
+            await client.place_orders_grouped(entry, None, sl)
+
+    @pytest.mark.asyncio
+    async def test_no_address_raises(self) -> None:
+        client = HyperLiquidClient(
+            network="testnet", address=None, agent_private_key=_TEST_PRIV
+        )
+        entry = _make_request()
+        sl = _trigger_request(trigger_price=Decimal("63000"))
+        with pytest.raises(ExchangeError, match="address is required"):
+            await client.place_orders_grouped(entry, None, sl)
+
+    @pytest.mark.asyncio
+    async def test_no_private_key_raises(self) -> None:
+        client = HyperLiquidClient(
+            network="testnet", address=_TEST_ADDR, agent_private_key=None
+        )
+        entry = _make_request()
+        sl = _trigger_request(trigger_price=Decimal("63000"))
+        with pytest.raises(ExchangeError, match="agent_private_key is required"):
+            await client.place_orders_grouped(entry, None, sl)
+
+    @pytest.mark.asyncio
+    async def test_sdk_exception_propagates(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.bulk_orders = MagicMock(
+            side_effect=ConnectionError("net down")
+        )
+        entry = _make_request()
+        sl = _trigger_request(trigger_price=Decimal("63000"))
+        with pytest.raises(ExchangeError, match="Failed to place grouped"):
+            await client.place_orders_grouped(entry, None, sl)
+
+
+# ────────────────────────────────────────────────
 # E2E（testnet 実接続・デフォルト skip）
 # ────────────────────────────────────────────────
 
@@ -1843,3 +2298,48 @@ class TestE2EPlaceOrder:
         )
         with pytest.raises(OrderRejectedError):
             await client.place_order(request)
+
+
+# ────────────────────────────────────────────────
+# E2E place_trigger_order（PR6.4.3）
+# ────────────────────────────────────────────────
+
+
+@pytest.mark.e2e
+class TestE2ETriggerOrder:
+    """testnet で place_trigger_order の入口バリデーションを確認するテスト。
+
+    実発注は無し（既存ポジションが無いと reduce_only 違反になりやすい）。
+    リクエスト構造のバリデーションが効くことだけ検証する。
+    """
+
+    @pytest.fixture
+    def client(self) -> HyperLiquidClient:
+        import os
+
+        addr = os.getenv("HL_TESTNET_ADDRESS")
+        key = os.getenv("HL_TESTNET_AGENT_KEY")
+        if not addr or not key:
+            pytest.skip("HL_TESTNET_ADDRESS or HL_TESTNET_AGENT_KEY not set")
+        return HyperLiquidClient(
+            network="testnet",
+            address=addr,
+            agent_private_key=key,
+        )
+
+    @pytest.mark.asyncio
+    async def test_trigger_order_invalid_request_raises(
+        self, client: HyperLiquidClient
+    ) -> None:
+        bad = TriggerOrderRequest(
+            symbol="BTC",
+            side="sell",
+            size=Decimal("0.0002"),
+            trigger_price=Decimal("70000"),
+            is_market=False,
+            limit_price=None,
+            tpsl="sl",
+            reduce_only=True,
+        )
+        with pytest.raises(ExchangeError, match="limit_price is required"):
+            await client.place_trigger_order(bad)
