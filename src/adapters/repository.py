@@ -146,3 +146,15 @@ class Repository(Protocol):
     ) -> None: ...
 
     async def mark_manual_review(self, trade_id: int) -> None: ...
+
+    # ─── OI履歴（章13.5） ───
+    async def record_oi(
+        self, symbol: str, timestamp: datetime, oi_value: Decimal
+    ) -> None: ...
+
+    async def get_oi_at(
+        self,
+        symbol: str,
+        target_time: datetime,
+        tolerance_minutes: int,
+    ) -> Decimal | None: ...
