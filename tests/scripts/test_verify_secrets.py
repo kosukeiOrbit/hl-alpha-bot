@@ -73,6 +73,37 @@ class TestHyperLiquidSecrets:
                 network="testnet",
             )
 
+    def test_coerce_int_address_to_hex(self) -> None:
+        # PyYAML は unquoted な 0x... を int に解釈する。validator で復元できること。
+        s = HyperLiquidSecrets(
+            master_address=0x910571363855665C9511F06ED7B691AB32FC1BD5,  # type: ignore[arg-type]
+            agent_private_key=VALID_PRIVATE_KEY,
+            agent_address=VALID_ADDRESS2,
+            network="testnet",
+        )
+        assert s.master_address == "0x910571363855665c9511f06ed7b691ab32fc1bd5"
+
+    def test_coerce_int_private_key_to_hex(self) -> None:
+        s = HyperLiquidSecrets(
+            master_address=VALID_ADDRESS,
+            agent_private_key=0x1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF,  # type: ignore[arg-type]
+            agent_address=VALID_ADDRESS2,
+            network="testnet",
+        )
+        expected = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        assert s.agent_private_key == expected
+
+    def test_coerce_int_pads_leading_zeros(self) -> None:
+        # 先頭がゼロのアドレスでも 0x + 40桁にパディングされること。
+        s = HyperLiquidSecrets(
+            master_address=0x0011223344556677889900112233445566778899,  # type: ignore[arg-type]
+            agent_private_key=VALID_PRIVATE_KEY,
+            agent_address=VALID_ADDRESS2,
+            network="testnet",
+        )
+        assert s.master_address == "0x0011223344556677889900112233445566778899"
+        assert len(s.master_address) == 42
+
     def test_invalid_private_key_length(self) -> None:
         # 短すぎ
         with pytest.raises(ValidationError):

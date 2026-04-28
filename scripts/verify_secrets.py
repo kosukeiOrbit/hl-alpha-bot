@@ -16,21 +16,58 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import subprocess
 import sys
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ValidationError, field_validator
+
+_ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+_PRIVATE_KEY_RE = re.compile(r"^0x[a-fA-F0-9]{64}$")
 
 
 class HyperLiquidSecrets(BaseModel):
-    """章23.3 の HyperLiquid セクションのスキーマ。"""
+    """章23.3 の HyperLiquid セクションのスキーマ。
 
-    master_address: str = Field(pattern=r"^0x[a-fA-F0-9]{40}$")
-    agent_private_key: str = Field(pattern=r"^0x[a-fA-F0-9]{64}$")
-    agent_address: str = Field(pattern=r"^0x[a-fA-F0-9]{40}$")
+    sops 復号後の YAML を PyYAML が読むと、クォートが剥がれた `0x...` は
+    16進整数として int に解釈されてしまう。`mode="before"` の validator で
+    int を 0x プレフィックス付きのゼロパディング hex 文字列へ復元する。
+    """
+
+    master_address: str
+    agent_private_key: str
+    agent_address: str
     network: Literal["mainnet", "testnet"]
+
+    @field_validator("master_address", "agent_address", mode="before")
+    @classmethod
+    def coerce_address(cls, v: object) -> object:
+        if isinstance(v, int) and not isinstance(v, bool):
+            return "0x" + format(v, "040x")
+        return v
+
+    @field_validator("agent_private_key", mode="before")
+    @classmethod
+    def coerce_private_key(cls, v: object) -> object:
+        if isinstance(v, int) and not isinstance(v, bool):
+            return "0x" + format(v, "064x")
+        return v
+
+    @field_validator("master_address", "agent_address")
+    @classmethod
+    def validate_address_format(cls, v: str) -> str:
+        if not _ADDRESS_RE.match(v):
+            raise ValueError(f"Invalid address format: {v}")
+        return v
+
+    @field_validator("agent_private_key")
+    @classmethod
+    def validate_private_key_format(cls, v: str) -> str:
+        if not _PRIVATE_KEY_RE.match(v):
+            raise ValueError(f"Invalid private key format: {v}")
+        return v
 
 
 class SecretsSchema(BaseModel):
@@ -47,6 +84,7 @@ def decrypt_secrets() -> dict[str, object]:
             capture_output=True,
             text=True,
             check=True,
+            encoding="utf-8",
         )
     except FileNotFoundError:
         print("❌ sops コマンドが見つかりません")
