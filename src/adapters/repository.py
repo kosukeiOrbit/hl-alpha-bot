@@ -21,7 +21,12 @@ from src.core.models import EntryDecision
 
 @dataclass(frozen=True)
 class Trade:
-    """trades テーブル（章8.2）。"""
+    """trades テーブル（章8.2）。
+
+    is_filled / actual_entry_price / tp_order_id / sl_order_id は
+    PR7.2 で追加。grouped 発注時点では tp/sl の order_id は不明で、
+    entry が約定してから position_monitor が紐付ける（章14.6）。
+    """
 
     id: int
     symbol: str
@@ -42,6 +47,10 @@ class Trade:
     mfe_pct: Decimal | None
     mae_pct: Decimal | None
     closed_at: datetime | None
+    is_filled: bool = False
+    actual_entry_price: Decimal | None = None
+    tp_order_id: int | None = None
+    sl_order_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +126,25 @@ class Repository(Protocol):
 
     async def update_trade_vwap_metrics(
         self, trade_id: int, metrics: dict[str, Any]
+    ) -> None: ...
+
+    # ─── PR7.2 position_monitor 用 ───
+    async def mark_trade_filled(
+        self, trade_id: int, fill_price: Decimal, fill_time: datetime
+    ) -> None: ...
+
+    async def update_tp_sl_order_ids(
+        self,
+        trade_id: int,
+        tp_order_id: int | None,
+        sl_order_id: int | None,
+    ) -> None: ...
+
+    async def update_mfe_mae(
+        self,
+        trade_id: int,
+        mfe_pct: Decimal,
+        mae_pct: Decimal,
     ) -> None: ...
 
     # ─── Signals ───
