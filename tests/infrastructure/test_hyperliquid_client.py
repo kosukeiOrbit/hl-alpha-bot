@@ -1638,7 +1638,7 @@ class TestBuildTriggerOrderType:
         assert HyperLiquidClient._build_trigger_order_type(req) == {
             "trigger": {
                 "isMarket": True,
-                "triggerPx": "70000",
+                "triggerPx": 70000.0,
                 "tpsl": "sl",
             }
         }
@@ -1653,7 +1653,7 @@ class TestBuildTriggerOrderType:
         assert HyperLiquidClient._build_trigger_order_type(req) == {
             "trigger": {
                 "isMarket": False,
-                "triggerPx": "80000",
+                "triggerPx": 80000.0,
                 "tpsl": "tp",
             }
         }
@@ -1693,7 +1693,7 @@ class TestPlaceTriggerOrder:
         assert call_args[0][4] == {
             "trigger": {
                 "isMarket": True,
-                "triggerPx": "70000",
+                "triggerPx": 70000.0,
                 "tpsl": "sl",
             }
         }

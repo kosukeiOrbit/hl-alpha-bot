@@ -851,14 +851,18 @@ class HyperLiquidClient:
         """TriggerOrderRequest を SDK の order_type dict に変換（章22.4）。
 
         SDK 形式:
-        {"trigger": {"isMarket": bool, "triggerPx": str, "tpsl": "tp"|"sl"}}
+        {"trigger": {"isMarket": bool, "triggerPx": float, "tpsl": "tp"|"sl"}}
+
+        triggerPx は float で渡す。SDK 内部の float_to_wire が
+        f"{x:.8f}" で wire 文字列化するので、str を渡すと
+        ValueError: Unknown format code 'f' for str になる。
         """
         if request.tpsl not in ("tp", "sl"):
             raise ExchangeError(f"Invalid tpsl: {request.tpsl}")
         return {
             "trigger": {
                 "isMarket": request.is_market,
-                "triggerPx": str(request.trigger_price),
+                "triggerPx": float(request.trigger_price),
                 "tpsl": request.tpsl,
             }
         }
