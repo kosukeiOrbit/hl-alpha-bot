@@ -345,7 +345,7 @@ def is_not_overheated_short(ctx: PriceContext) -> bool:
 ### 5.6 utc_open_priceの取得・記録方法
 
 HyperLiquid APIは`prevDayPx`（24h前価格）は返すが、UTC 00:00価格は直接取得できない。
-**3層フォールバック方式で取得する：**
+**3層フォールバック方式で取得する**：
 
 #### 取得方法の優先順位
 
@@ -388,7 +388,7 @@ async def _get_utc_day_open_price(self, symbol: str) -> Decimal:
     return Decimal(str(response[0]["o"]))
 ```
 
-#### 自動スナップショット（オプション・優先2 用）
+#### 自前スナップショット（オプション・優先2 用）
 
 長期的なフォールバックとして、UTC 00:00直後にスナップショットを記録：
 
@@ -404,7 +404,7 @@ async def snapshot_utc_open():
         wait_seconds = (next_midnight - now).total_seconds()
         await asyncio.sleep(wait_seconds)
 
-        prices = fetch_all_mark_prices()  # HL APIから一括取得
+        prices = fetch_all_mark_prices()
         save_to_db(
             table="utc_open_prices",
             date=next_midnight.date(),
@@ -424,8 +424,7 @@ CREATE TABLE utc_open_prices (
 );
 ```
 
-#### 起動時の grace period（章9.8 DataReadinessGate）
-
+**起動時の grace period（章9.8 DataReadinessGate）：**
 - UTC 00:00 直後の数分は 1h 足が未生成 → `_get_utc_day_open_price` が失敗する
 - DataReadinessGate で UTC 00:00 + 10分 まで grace period を設ける
 - それでも失敗したら `prevDayPx` で代用（優先3）+ ログ警告
@@ -1108,7 +1107,7 @@ CREATE TABLE sentiment_logs (
   ├─ funding_payments       Funding精算記録
   ├─ deposits_withdrawals   入出金（オンチェーン）
   ├─ utc_open_prices        UTC 00:00価格スナップショット（章5.6）
-  ├─ oi_history             OI時系列（章13.5・1h前OI参照用）★追加
+  ├─ oi_history             OI時系列（章13.5・1h前OI参照用）
   ├─ usdjpy_rates           USD/JPYレート（税務用）
   └─ blacklist              当日エントリー禁止銘柄
 
@@ -1405,7 +1404,7 @@ CREATE INDEX idx_oi_symbol_time ON oi_history(symbol, timestamp);
 
 **運用ルール：**
 - ループ毎（10秒間隔・章19）に各銘柄の OI を記録
-- 起動から1h経過するまでの grace period は OI変化 = 0%扱い（章9.8）
+- 起動から1h経過するまでの grace period は OI変動 = 0%扱い（章9.8）
 - 直近24時間以前のデータは日次で削除（容量管理）
 
 **Repository メソッド（章11.5 ADAPTERS）：**
@@ -2343,6 +2342,17 @@ ExecStartPost=/bin/rm /tmp/hlbot.env
 
 ### 10.5 資金移動・出金ポリシー
 
+#### HyperLiquid mainnet の最低入金額（重要・実機検証済み）
+
+```
+HL mainnet の最低入金額: 5 USDC
+- これより少ないと入金 UI で拒否される
+- アカウント活性化の最小コスト
+- testnet も同様（mock USDC で）
+```
+
+testnet で取引するには、まず **mainnet で 5 USDC 入金してアカウントを活性化**する必要がある（章22.12 参照）。これは Sybil攻撃対策で、testnet Faucet の利用条件にも mainnet 活性化が含まれる。
+
 #### 入金（Master → SubAccount）
 
 ```
@@ -3004,7 +3014,7 @@ class EntryFlow:
     async def _build_snapshot(self, symbol: str) -> MarketSnapshot:
         """各ソースから情報を集めてSnapshotを組み立てる
 
-        【責任分担】
+        【責務分担】
         Exchange (ExchangeProtocol.get_market_snapshot) で埋まるフィールド：
           - symbol, current_price, vwap
           - utc_open_price, rolling_24h_open
@@ -3014,7 +3024,7 @@ class EntryFlow:
           - flow_buy_sell_ratio（WS trades 実装後）★
           - flow_large_order_count（WS trades 実装後）★
 
-        APPLICATION層で埋めるフィールド（Exchange 単独では埋まらない）：
+        APPLICATION層で埋めるフィールド（Exchange 単独では取れない）：
           - sentiment_score, sentiment_confidence ← SentimentProvider
           - btc_ema_trend, btc_atr_pct ← BTCのMarketSnapshotから別途集計
           - open_interest_1h_ago ← Repository（OI履歴）から取得
@@ -3033,8 +3043,8 @@ class EntryFlow:
 
         # BTC レジーム情報（別 snapshot から導出）
         btc_snap = await self.exchange.get_market_snapshot("BTC")
-        btc_ema_trend = self._calc_ema_trend(btc_snap)  # CORE純関数想定
-        btc_atr_pct = self._calc_atr_pct(btc_snap)
+        btc_ema_trend = self._calc_btc_ema_trend(btc_snap)  # 簡易実装（後述）
+        btc_atr_pct = self._calc_btc_atr_pct(btc_snap)
 
         # OI履歴（Repository 経由）
         oi_now = await self.exchange.get_open_interest(symbol)
@@ -3042,7 +3052,7 @@ class EntryFlow:
             symbol, now() - timedelta(hours=1)
         )
 
-        # MarketSnapshot をAPPLICATION層で完成させる
+        # MarketSnapshot を「APPLICATION層で完成」させる
         return market.with_sentiment_and_regime(
             sentiment_score=sentiment.score,
             sentiment_confidence=sentiment.confidence,
@@ -3051,13 +3061,61 @@ class EntryFlow:
             open_interest=oi_now,
             open_interest_1h_ago=oi_1h_ago or oi_now,
         )
+
+    @staticmethod
+    def _calc_btc_ema_trend(btc_snap: MarketSnapshot) -> bool:
+        """BTC EMA20 > EMA50 の判定（章4 ④REGIME）
+
+        【PR7.1 簡易実装】
+        rolling_24h_open との比較で「24h 上昇傾向」を代理指標とする。
+        - 軽量・追加API呼び出し不要
+        - 精度は粗い
+
+        【後続PRで精緻化】
+        CORE 層に純関数 calculate_ema(prices, period) を追加し、
+        ローソク足から EMA20 と EMA50 を実際に計算する：
+
+            from src.core.indicators import calculate_ema
+            candles = await exchange._fetch_recent_candles("BTC", "15m", 50)
+            closes = [c["c"] for c in candles]
+            ema20 = calculate_ema(closes, 20)
+            ema50 = calculate_ema(closes, 50)
+            return ema20 > ema50
+        """
+        return btc_snap.current_price > btc_snap.rolling_24h_open
+
+    @staticmethod
+    def _calc_btc_atr_pct(btc_snap: MarketSnapshot) -> float:
+        """BTC ATR% の判定（章4 ④REGIME）
+
+        【PR7.1 簡易実装】
+        24h 高安幅を ATR の代理として使う。
+        - 軽量・即時計算可能
+        - 真の ATR ではない
+
+        【後続PRで精緻化】
+        CORE 層に純関数 calculate_atr(highs, lows, closes, period) を追加：
+
+            from src.core.indicators import calculate_atr
+            candles = await exchange._fetch_recent_candles("BTC", "15m", 14)
+            atr = calculate_atr(
+                highs=[c["h"] for c in candles],
+                lows=[c["l"] for c in candles],
+                closes=[c["c"] for c in candles],
+                period=14,
+            )
+            return atr / btc_snap.current_price
+        """
+        if btc_snap.current_price == 0:
+            return 0.0
+        return (btc_snap.high_24h - btc_snap.low_24h) / btc_snap.current_price
 ```
 
 **この設計のポイント：**
 - ロジックは`judge_*_entry`に丸投げ
 - I/Oはアダプター経由
 - テスト時は4つのアダプターをモック化するだけ
-- `MarketSnapshot.with_sentiment_and_regime()` のような部分上書きメソッドで責務を明示化
+- `MarketSnapshot.with_sentiment_and_regime()` のような「部分上書き」メソッドで責務を明示化
 
 ### 11.6.3 FLOWシグナルの実装方針（重要）
 
@@ -3068,8 +3126,8 @@ class EntryFlow:
 ```
 Phase A（PR6.2 完了時点）: FLOW 層 bypass
   - settings.yaml: trading.long.flow_layer_enabled: false
-  - entry_judge は flow_layer_enabled=false の時 ② をスキップ
-  - 暫定実装で誤判定するよりも、明示的に飛ばす方が安全
+  - entry_judge は flow_layer_enabled=false の時 ②をスキップ
+  - 暫定実装で誤判定するより、明示的に飛ばす方が安全
 
 Phase B（PR6.5 想定・WS trades 実装後）: FLOW 層 enable
   - WebSocketで trades をストリーム購読
@@ -3078,19 +3136,50 @@ Phase B（PR6.5 想定・WS trades 実装後）: FLOW 層 enable
   - Phase 0 でドライラン → 閾値検証
 ```
 
-**判定スキップの実装（章11.4 entry_judge）：**
+**判定スキップの実装（PR7.1 で確定・APPLICATION 層）：**
+
+CORE 層の `judge_long_entry` は config を受け取らない純関数のままにする。
+代わりに **APPLICATION 層 (entry_flow.py) で bypass を行う**：
 
 ```python
-def judge_long_entry(snap, config) -> EntryDecision:
-    # ... ① momentum, ④ regime, ③ sentiment
+# src/application/entry_flow.py
+class EntryFlow:
+    def _judge(self, snap, direction) -> EntryDecision:
+        # CORE層の純関数（config非依存）
+        if direction == "LONG":
+            decision = judge_long_entry(snap)
+        else:
+            decision = judge_short_entry(snap)
 
-    # ② FLOW（条件付きスキップ）
-    flow_passed = True
-    if config.trading.long.flow_layer_enabled:
-        flow_passed = _check_flow_long(snap)
+        # APPLICATION 層で bypass
+        if not self.config.flow_layer_enabled:
+            decision = self._bypass_flow(decision)
 
-    # ...
+        return decision
+
+    @staticmethod
+    def _bypass_flow(decision: EntryDecision) -> EntryDecision:
+        """layer_results.flow を True 上書き → should_enter 再計算"""
+        new_layer_results = dict(decision.layer_results)
+        new_layer_results["flow"] = True
+        all_pass = all(new_layer_results.values())
+        new_rejection = decision.rejection_reason
+        if new_rejection and "flow" in new_rejection.lower():
+            new_rejection = None
+        return replace(
+            decision,
+            should_enter=all_pass,
+            layer_results=new_layer_results,
+            rejection_reason=new_rejection,
+        )
 ```
+
+**設計判断：** CORE 層は純関数原則（config非依存）を維持し、
+動的な bypass は呼び出し側 (APPLICATION) に集約する。
+これにより：
+- CORE層のテストは config 不要で通せる
+- bypass の有効/無効切替は config 設定の変更だけで済む
+- 将来 bypass 条件を増やす時も CORE 層を変更不要
 
 **WS trades 実装の概要（PR6.5 想定）：**
 
@@ -3104,11 +3193,9 @@ class HyperLiquidWebSocket:
     """
     async def subscribe_trades(self, symbol: str) -> None:
         # WSサブスクライブ → 5分rolling window更新
-        ...
 
     def get_flow_metrics(self, symbol: str) -> FlowMetrics:
         # buy_usd_5min / sell_usd_5min / large_buy_count / large_sell_count
-        ...
 ```
 
 これは章22.8 の WebSocket仕様に沿って実装する。
@@ -3709,10 +3796,10 @@ def judge_regime_long(input: RegimeInput) -> tuple[bool, str | None]:
     return True, None
 ```
 
-#### OI履歴の管理責任（重要・APPLICATION層）
+#### OI履歴の管理責務（重要・APPLICATION層）
 
 `open_interest_1h_ago` は HL公式 API の単発呼び出しでは取れない。
-**APPLICATION 層で履歴を保持する必要がある：**
+**APPLICATION 層で履歴を保持する必要がある**：
 
 ```python
 # src/application/entry_flow.py（抜粋）
@@ -3729,7 +3816,7 @@ async def _build_snapshot(self, symbol: str) -> MarketSnapshot:
     # OI を spawn のたびに記録（後で 1h前として参照される）
     await self.repo.record_oi(symbol, now(), oi_now)
 
-    # 1h前データがまだ無い場合は現在値を代用（OI変化 = 0%扱い）
+    # 1h前データがまだ無い場合は現在値を代用（OI変動 = 0%扱い）
     return market.with_regime(
         open_interest=oi_now,
         open_interest_1h_ago=oi_1h_ago or oi_now,
@@ -3749,14 +3836,25 @@ class Repository(Protocol):
     async def get_oi_at(
         self, symbol: str, timestamp: datetime, tolerance_minutes: int = 5
     ) -> Decimal | None:
-        """指定時刻に最も近いOIを返す（±tolerance分に無ければNone）"""
+        """指定時刻に最も近いOIを返す（±tolerance内に無ければNone）"""
 ```
 
-**oi_history テーブル設計：** 章8.5b に詳述
+**oi_history テーブル設計：**
 
-**保持期間：** 直近24時間で十分（古いデータは日次で削除）
+```sql
+CREATE TABLE oi_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol      TEXT NOT NULL,
+    timestamp   DATETIME NOT NULL,
+    oi          REAL NOT NULL,
+    UNIQUE(symbol, timestamp)
+);
+CREATE INDEX idx_oi_symbol_time ON oi_history(symbol, timestamp);
+```
 
-**起動直後の grace period：** OI履歴が1h分溜まるまでは `open_interest_1h_ago=open_interest` で OI変化0%扱い。これは章9.8 の DataReadinessGate に追加する。
+**保持期間：** 直近24時間で十分（古いデータは日次で削除）。
+
+**起動直後の grace period：** OI履歴が1h分溜まるまでは `open_interest_1h_ago=open_interest` で OI変動0%扱い。これは章9.8 の DataReadinessGate に追加する。
 
 #### 将来の拡張（章20.A 自分の清算データFB）
 
@@ -3937,6 +4035,59 @@ trading:
 
 **メリット：** エントリー約定とSL/TP発注の時間差ゼロ → スリッページ最小化
 **注意：** SL/TPは事前に決定する必要があるため、エントリー時点でATR等が計算済みであること
+
+#### 実機検証で判明した挙動（重要・PR6.4.3）
+
+testnet で `place_orders_grouped` を実行すると、3 つの `OrderResult` が返るが、
+**動作は非対称**：
+
+```python
+results = await client.place_orders_grouped(entry, tp, sl)
+# results[0] (entry): success=True, order_id=12345  ← 板に乗る
+# results[1] (tp):    success=True, order_id=None   ← entry 約定まで保留
+# results[2] (sl):    success=True, order_id=None   ← entry 約定まで保留
+```
+
+**仕様：**
+1. entry のみ通常通り板に乗る（即時 `order_id` 取得可）
+2. tp/sl は HL 側で「entry 約定待ち」状態で保留される
+3. entry が約定すると tp/sl が**自動発注**される（その時点で order_id 確定）
+4. entry を `cancel_order` すると、tp/sl も自動的に無効化される
+5. tp/sl の `order_id` を後で取得するには、約定後に `open_orders` で照会
+
+**実装上の影響：**
+
+| 項目 | 対応 |
+|---|---|
+| `OrderResult.success=True && order_id=None` | 「保留中」として正常扱い（失敗ではない） |
+| Repository.open_trade のタイミング | entry 発注時点で `trade_id` 確定可能 |
+| tp_price / sl_price の保存 | entry 発注時点で予定価格を Repository に記録 |
+| tp/sl の `order_id` 紐付け | **約定検知後**（PR7.2 position_monitor）で実施 |
+
+**PR7.2 で実装すべきフロー：**
+
+```python
+# position_monitor の擬似コード
+async def _on_entry_filled(trade_id: int):
+    """entry 約定検知時の処理"""
+    # 1. trade をマーク（is_filled=True）
+    await repo.mark_trade_filled(trade_id)
+
+    # 2. 自動発注された TP/SL の order_id を取得
+    open_orders = await exchange.get_open_orders()
+    trade = await repo.get_trade(trade_id)
+    related = [o for o in open_orders
+               if o.symbol == trade.symbol and o.reduce_only]
+
+    # 3. trade に tp_order_id / sl_order_id を紐付け
+    for order in related:
+        if 価格が tp 側:
+            await repo.update_tp_order_id(trade_id, order.order_id)
+        elif 価格が sl 側:
+            await repo.update_sl_order_id(trade_id, order.order_id)
+```
+
+これにより、章9.3 の状態復元（reconciliation）で trade と order_id が一貫して扱える。
 
 ---
 
@@ -4616,6 +4767,61 @@ Take Limit:  利確用limit
 - ALO拒否時は`status: error`が返るので再評価ロジック必須
 - 章9.5の冪等注文設計：HLには`client_order_id`相当として`cloid`がある（任意）
 
+#### 最小注文額（実機検証済み）
+
+```
+最小名目額: $10 USDC
+```
+
+これより小さい注文（size × price < $10）は HL 側で拒否される：
+
+```
+"Order must have minimum value of $10. asset=N"
+```
+
+サイズ計算（章13）では `size_coins × price >= $10` を保証する必要がある。
+特に Phase 2-4 の小額運用時は、leverage と価格次第で**最小サイズが大きくなる**ため事前検算必須。
+
+#### SDK 経由の数値型（罠あり）
+
+公式 hyperliquid-python-sdk を使う場合、`order_type` dict 内の数値フィールドは
+**float で渡す必要がある**：
+
+```python
+# ❌ NG（SDK の signing.py で TypeError）
+{"trigger": {"triggerPx": "70000", ...}}  # str はダメ
+
+# ✅ OK
+{"trigger": {"triggerPx": float(trigger_price), ...}}
+```
+
+理由：SDK 内部で `f"{x:.8f}"` のような書式指定で wire 形式（文字列）に変換する。
+公式 REST API の最終形式は文字列だが、SDK が内部で float→string 変換するため、
+Python 側からは float を渡すべき。
+
+これは `place_order` の `limit_px` や `trigger_order` の `triggerPx` 共通の慣習。
+
+#### grouped 注文（normalTpsl）の挙動（実機検証済み）
+
+```python
+# entry + TP + SL を1コマンドで連結（章14.6）
+results = await client.place_orders_grouped(entry, tp, sl)
+# → tuple[OrderResult, ...] 順番は (entry, tp, sl)
+```
+
+**重要な仕様：**
+1. `entry` は通常通り板に乗る → `order_id` 取得可能
+2. `tp` / `sl` は **entry が約定するまで HL 側で保留** → 即時 `order_id` は **None**
+3. entry 約定で tp/sl が自動発注される（その時点で order_id 確定）
+4. entry をキャンセルすれば tp/sl も自動的に無効化
+5. tp/sl の order_id を取得するには、約定後に `open_orders` で再取得
+
+**実装上の影響：**
+- `OrderResult.success=True` でも `order_id=None` のケースは正常動作
+- これは「失敗」ではなく「保留中」
+- Repository で `open_trade` する時点では tp/sl の order_id は紐付け不可
+- **約定検知（PR7.2 position_monitor）で order_id を後付けで紐付ける**
+
 ### 22.5 価格・サイズの精度（必須知識）
 
 ```
@@ -4698,6 +4904,64 @@ HYPEトークンステーキングで5%〜40%割引（>10 HYPE で5%、>500K HYP
 **サポートする candle interval：**
 `1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 8h, 12h, 1d, 3d, 1w, 1M`
 
+#### SDK レスポンスのフィールド仕様（実機検証済み）
+
+##### side フィールドの表現混在
+
+`info.open_orders()` と `info.user_fills_by_time()` のレスポンスで、
+`side` フィールドの表現が**箇所により異なる**：
+
+| ソース | 値 |
+|---|---|
+| HL公式 REST API（生） | `"B"` / `"A"` (Bid/Ask) |
+| SDK 経由（場所により） | `"B"` / `"A"` または `"buy"` / `"sell"` |
+
+**INFRASTRUCTURE 層で正規化必須：**
+
+```python
+side: Literal["buy", "sell"] = "buy" if side_raw in ("B", "buy") else "sell"
+```
+
+##### orderStatus の状態文字列リスト
+
+`info.query_order_by_oid()` レスポンスの `order.status` で実際に観測される文字列：
+
+| HL の値 | Protocol の Literal |
+|---|---|
+| `"open"` | `"pending"` |
+| `"triggered"` | `"pending"` |
+| `"filled"` | `"filled"` |
+| `"canceled"` または `"cancelled"`（綴り両方あり） | `"cancelled"` |
+| `"rejected"` | `"rejected"` |
+
+未知の状態は保守的に `"pending"` 扱いにする。
+
+##### liquidationPx は null 可
+
+`assetPositions[].position.liquidationPx` は以下の場合 `null`：
+- ポジションサイズが小さい
+- レバレッジが低い
+- 含み益が大きく清算されにくい
+
+実装では `Decimal | None` 型で扱う。
+
+#### ALO 拒否のメッセージ実例（実機検証済み）
+
+ALO 注文が即マッチしそうな価格で発注されると拒否される。
+実際のメッセージ：
+
+```
+"Post only order would have immediately matched, bbo was 76382@76387. asset=3"
+```
+
+**`_raise_inner_error` の判定ロジック：**
+- `"post only"` を含む → `OrderRejectedError(code="ALO_REJECT")`
+- `"would have matched"` を含む → 同上
+- `"would have immediately matched"` を含む → 同上
+- `"ALO"` を含む（大文字小文字問わず）→ 同上
+
+判定は `error_msg.lower()` で行い、複数キーワードを許容する。
+
 ### 22.8 重要なWebSocketサブスクリプション
 
 | type | 内容 | 用途 |
@@ -4760,35 +5024,62 @@ expiresAfter: オプション・タイムスタンプ後は拒否
 
 | エラー | 原因 | 対処 |
 |---|---|---|
-| `Order rejected because it would have immediately matched (ALO)` | Alo注文がマッチしそう | 価格を1tick下げる/上げる・再発注 |
+| `Post only order would have immediately matched, bbo was X@Y. asset=N` | Alo注文がマッチしそう（実機検証済みメッセージ） | 価格を1tick下げる/上げる・再発注 |
+| `Order must have minimum value of $10. asset=N` | 最小注文額（$10）未満 | サイズを増やす |
 | `Insufficient margin` | 証拠金不足 | サイズ縮小 or 別ポジションクローズ |
 | `Tick size mismatch` | 価格精度違反 | szDecimalsベースで丸める |
-| `User or API Wallet does not exist` | アドレス未初期化 | 1 USDCを入金して活性化 |
+| `User or API Wallet 0x... does not exist` | アドレス未初期化 or Agent未承認 or Agent秘密鍵とアドレス不一致 | 1 USDCを入金して活性化・Agent承認・整合性検証 |
 | `Reduce only order would not reduce position` | reduce_onlyで増ポジションになる | order作成ロジック修正 |
 | `Trigger price wrong side` | TP/SL価格がmid側を間違っている | 方向検証ロジック追加 |
 | `Order limit reached` | 同時open order数超過（1000+5M USDCあたり1） | 古い注文をキャンセル |
+| `Cannot claim drip because user 0x... does not exist on mainnet` | testnet Faucet が mainnet 活性化を要求 | mainnet で 5 USDC 入金後リトライ |
 
 ### 22.12 アクティベーションgas代
 
-新規アドレスは**1 USDC**の入金で活性化される。
-2025年〜2026年現在、`activation gas fee`として1 USDCが必要。
+新規アドレスは **mainnet で 5 USDC** の入金で活性化される（実機検証済み・2026年現在）。
 これを払わないと注文できない。
 
+**重要な仕様（実機検証で判明）：**
+
+```
+HL mainnet 最低入金額: 5 USDC（活性化と兼用）
+testnet Faucet の利用条件: アドレスが mainnet で活性化されていること
+```
+
+つまり **testnet で取引するためにも、まず mainnet で 5 USDC 入金が必要**。
+これは Sybil 攻撃対策と思われる。
+
+**testnet での開発フロー：**
+
+```
+1. Master Wallet（EOA）を準備
+2. Arbitrum One で 5+ USDC を保有
+3. HL mainnet (https://app.hyperliquid.xyz/) で 5 USDC 入金
+   → アドレスが mainnet で活性化される
+4. HL testnet (https://app.hyperliquid-testnet.xyz/) で Faucet
+   → 1000 mock USDC 取得（mainnet 残高はそのまま）
+5. testnet で開発・検証
+6. mainnet 本番運用は別途追加入金
+```
+
 **設計への影響：**
-- 章10.6のPhase 2投入額$200〜500なら問題なし
-- testnet環境は無料のtest USDCを入金して使う
+- 章10.5 の Phase 0-2 投入額は **5 USDC + α** から始まる
+- testnet 開発のためだけに 5 USDC のコストがかかる
+- 実費約 $5（≒ ¥750）が開発前提
 
 ### 22.13 testnet利用方法
 
 ```
-1. https://app.hyperliquid-testnet.xyz/ にアクセス
-2. ウォレット接続（Mainnetと同じMetaMask等）
-3. 「Faucet」から testnet USDC を取得（無料）
-4. 通常通り取引可能
+1. mainnet で 5 USDC 入金（活性化）← 必須前提
+2. https://app.hyperliquid-testnet.xyz/ にアクセス
+3. ウォレット接続（Mainnetと同じMetaMask等）
+4. 「Faucet」から testnet USDC を取得（無料・1000 mock USDC/回）
+5. 通常通り取引可能
 ```
 
 **注意：** testnetのデータはmainnetと完全に分離。
 testnet APIエンドポイント（`api.hyperliquid-testnet.xyz`）を使う。
+ただし**活性化条件は mainnet 共通**（章22.12 参照）。
 
 ### 22.14 設計書への反映済み修正
 
@@ -4855,6 +5146,8 @@ hl-alpha-bot/
 │   ├── .age-key.example              # サンプル鍵
 │   └── .gitignore                    # 実鍵除外
 │
+├── .sops.yaml                        # sops の設定（プロジェクトルート）
+│
 ├── config/                           # 通常設定（git管理）
 │   ├── settings.yaml                 # 基本設定（全環境共通）
 │   ├── profile_dev.yaml              # 開発環境差分
@@ -4869,18 +5162,55 @@ hl-alpha-bot/
 └── pyproject.toml                    # Python依存・lintツール（コード関連のみ）
 ```
 
-**重要：** `pyproject.toml`はコード設定（Python依存・lint）専用。
-**取引パラメータは絶対にここに書かない。**
+#### .sops.yaml の正しい書き方（実機検証済み・罠あり）
+
+`.sops.yaml` の `path_regex` は **入力ファイル名で判定される**。
+出力先のファイル名（`.enc.yaml`）にだけマッチさせると `sops -e` で
+「no matching creation rules found」エラーになる。
+
+**推奨形：**
+
+```yaml
+# プロジェクトルートの .sops.yaml
+creation_rules:
+  - path_regex: secrets/.*\.yaml$       # 入力・出力両方にマッチ
+    age: "age1abc..."                    # age 公開鍵（1行・必ずクォート）
+```
+
+**よくあるNG例：**
+
+```yaml
+# ❌ NG: secrets/secrets.yaml を sops -e する時マッチしない
+creation_rules:
+  - path_regex: secrets/.*\.enc\.yaml$  # .enc を含むパターン
+    age: "..."
+```
+
+**Windows PowerShell での作成：**
+
+```powershell
+# Bash の heredoc は使えない。代わりに:
+$content = @'
+creation_rules:
+  - path_regex: secrets/.*\.yaml$
+    age: "age1..."
+'@
+[System.IO.File]::WriteAllText("$PWD\.sops.yaml", $content,
+    [System.Text.UTF8Encoding]::new($false))   # BOM なし UTF-8
+```
+
+`Set-Content -Encoding utf8` は環境によって BOM を付けるので、
+sops のパーサーで失敗することがある。`UTF8Encoding($false)` で BOM なし指定。
 
 ### 23.3 secrets.enc.yaml（暗号化機密情報）
 
 ```yaml
 # secrets/secrets.enc.yaml（sops -e で暗号化）
 hyperliquid:
-  agent_private_key: "0x..."        # Agent Wallet秘密鍵
-  main_address: "0x..."             # Master Walletアドレス
-  sub_account: "hl-alpha-bot"
-  network: "mainnet"                 # mainnet / testnet
+  agent_private_key: "0x..."        # Agent Wallet秘密鍵（必ずクォート！）
+  master_address: "0x..."           # Master Walletアドレス（必ずクォート！）
+  agent_address: "0x..."            # Agent Walletアドレス（必ずクォート！）
+  network: "testnet"                # mainnet / testnet
 
 claude:
   api_key: "sk-ant-..."
@@ -4897,6 +5227,81 @@ external:
   reddit_client_id: ""
   reddit_secret: ""
 ```
+
+#### YAML クォートの罠（実機検証で判明・必須対応）
+
+`0x...` で始まるアドレスや秘密鍵は **必ずダブルクォートで囲む**：
+
+```yaml
+# ❌ NG: PyYAML が 16進数の整数として解釈してしまう
+master_address: 0x910571363855665c9511f06ed7b691ab32fc1bd5
+
+# ✅ OK
+master_address: "0x910571363855665c9511f06ed7b691ab32fc1bd5"
+```
+
+**さらに罠：** `sops -e` / `sops -d` は **YAMLのクォートを剥がす**。
+このため、復号後の値が int になってしまうケースが頻発する。
+
+**対処：pydantic 側で int → hex 文字列への自動復元**
+
+```python
+class HyperLiquidSecrets(BaseModel):
+    master_address: str
+    agent_private_key: str
+    agent_address: str
+    network: Literal["mainnet", "testnet"]
+
+    @field_validator("master_address", "agent_address", mode="before")
+    @classmethod
+    def coerce_address(cls, v: object) -> object:
+        """int 化されたアドレスを 40桁 hex に復元"""
+        if isinstance(v, int):
+            return "0x" + format(v, "040x")  # ゼロパディング必須
+        return v
+
+    @field_validator("agent_private_key", mode="before")
+    @classmethod
+    def coerce_private_key(cls, v: object) -> object:
+        """int 化された秘密鍵を 64桁 hex に復元"""
+        if isinstance(v, int):
+            return "0x" + format(v, "064x")
+        return v
+```
+
+これで sops が int に変換してしまった値も正常に扱える。
+
+#### Agent Wallet 整合性検証（起動時に必須）
+
+`agent_address` と `agent_private_key` が**別の Wallet のもの**だと、
+発注時に `User or API Wallet 0x... does not exist` エラーが出る。
+これは過去に複数回 Generate した際の取り違えで起きやすい。
+
+**起動時の自動検証ロジック：**
+
+```python
+def _validate_consistency(secrets: HyperLiquidSecrets) -> None:
+    """agent_private_key から導出される address と
+    agent_address の一致確認（起動時に必ず実行）"""
+    from eth_account import Account
+    derived = Account.from_key(secrets.agent_private_key).address
+    if derived.lower() != secrets.agent_address.lower():
+        raise SecretsLoadError(
+            f"agent_address mismatch: "
+            f"specified={secrets.agent_address}, derived={derived}. "
+            f"Either fix agent_address in secrets.yaml or "
+            f"approve {derived} in HyperLiquid UI."
+        )
+
+# load_secrets() の最後で必ず呼ぶ
+def load_secrets(...) -> HyperLiquidSecrets:
+    # ... 復号・パース・pydantic検証 ...
+    secrets = HyperLiquidSecrets(...)
+    _validate_consistency(secrets)  # ← 必須
+    return secrets
+```
+
+これにより、設定ミスを起動時に即座に検出できる。
 
 ### 23.4 settings.yaml（通常設定・基本値）
 
@@ -6173,4 +6578,66 @@ ORDER BY count DESC;
 ```
 
 DuckDBは無料・シングルバイナリで超高速。BOT稼働中でも安全に分析可能。
+
+### 26.10 OS依存の運用Tips（実機検証で判明）
+
+#### Windows cp932 と subprocess
+
+Windows のデフォルトエンコーディングは **cp932 (Shift-JIS)**。
+`subprocess.run` で UTF-8 出力を読むと `UnicodeDecodeError` になる：
+
+```
+UnicodeDecodeError: 'cp932' codec can't decode byte 0x90 in position 84
+```
+
+**対処：必ず `encoding="utf-8"` を明示する：**
+
+```python
+result = subprocess.run(
+    ["sops", "-d", "secrets/secrets.enc.yaml"],
+    capture_output=True,
+    text=True,
+    check=True,
+    encoding="utf-8",  # ← Windows必須
+)
+```
+
+`text=True` だけでは OS デフォルト（Windows なら cp932）が使われるため、
+クロスプラットフォームで動かしたいなら `encoding` 明示が必須ルール。
+
+#### Python モジュールパス
+
+`scripts/foo.py` から `from src.infrastructure.X import ...` する場合、
+**プロジェクトルートが PYTHONPATH に含まれていない**と `ModuleNotFoundError`：
+
+```
+ModuleNotFoundError: No module named 'src'
+```
+
+**対処1（恒久・推奨）：** スクリプト先頭で sys.path を追加
+
+```python
+# scripts/foo.py
+from __future__ import annotations
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# 以降、from src... が動く
+```
+
+**対処2（一時的）：** 環境変数で指定
+
+```bash
+# bash
+PYTHONPATH=. python scripts/foo.py
+
+# PowerShell
+$env:PYTHONPATH = "$PWD"
+python scripts/foo.py
+```
+
+**対処3：** `python -m scripts.foo` でモジュールとして実行
+
+恒久対応として **対処1** を推奨。これが無いと運用環境で起動失敗する。
 
