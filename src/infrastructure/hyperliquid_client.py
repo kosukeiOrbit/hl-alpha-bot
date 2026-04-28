@@ -7,9 +7,11 @@
 - get_symbols / get_l2_book / get_funding_rate_8h / get_open_interest (PR6.1)
 - get_tick_size / get_sz_decimals (PR6.1)
 - get_market_snapshot + helpers (PR6.2)
+- ユーザー状態取得 (PR6.3: get_positions / get_open_orders / get_fills /
+  get_funding_payments / get_account_balance_usd / get_order_status /
+  get_order_by_client_id)
 
 未実装（後続PR）:
-- ユーザー状態取得（PR6.3: get_positions / get_open_orders / get_fills 等）
 - 注文操作（PR6.4: place_order / cancel_order 等）
 """
 
@@ -19,14 +21,18 @@ import asyncio
 import logging
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from hyperliquid.info import Info  # type: ignore[import-untyped]
 
 from src.adapters.exchange import (
     ExchangeError,
+    Fill,
+    FundingPayment,
     L2Book,
     L2BookLevel,
+    Order,
+    Position,
     SymbolMeta,
 )
 from src.core.models import MarketSnapshot
@@ -381,3 +387,198 @@ class HyperLiquidClient:
             (level.price * level.size for level in top5_asks), Decimal("0")
         )
         return buy_usd, sell_usd
+
+    # ─── ユーザー状態取得（PR6.3・章22.7） ───
+
+    def _require_address(self) -> None:
+        """address が設定されているか確認。なければ ExchangeError を即時raise。"""
+        if not self.address:
+            raise ExchangeError(
+                "address is required for user state queries. "
+                "Pass address to HyperLiquidClient(address=...)"
+            )
+
+    async def get_positions(self) -> tuple[Position, ...]:
+        """現在のポジション一覧（章22.7 clearinghouseState / userState）。
+
+        size=0 のエントリは「ポジションなし」と見なしてスキップする。
+        """
+        self._require_address()
+        try:
+            response = await asyncio.to_thread(self.info.user_state, self.address)
+        except Exception as e:
+            raise ExchangeError(f"Failed to fetch positions: {e}") from e
+
+        positions: list[Position] = []
+        for asset_pos in response.get("assetPositions", []):
+            pos_data = asset_pos.get("position", {})
+            size_raw = Decimal(str(pos_data.get("szi", "0")))
+            if size_raw == 0:
+                continue
+
+            entry_px = Decimal(str(pos_data.get("entryPx", "0")))
+            unrealized_pnl = Decimal(str(pos_data.get("unrealizedPnl", "0")))
+            leverage = pos_data.get("leverage", {})
+            leverage_value = int(leverage.get("value", 1))
+            liquidation_px_raw = pos_data.get("liquidationPx")
+            liquidation_px = (
+                Decimal(str(liquidation_px_raw))
+                if liquidation_px_raw is not None
+                else None
+            )
+
+            positions.append(
+                Position(
+                    symbol=pos_data["coin"],
+                    size=size_raw,
+                    entry_price=entry_px,
+                    unrealized_pnl=unrealized_pnl,
+                    leverage=leverage_value,
+                    liquidation_price=liquidation_px,
+                )
+            )
+        return tuple(positions)
+
+    async def get_open_orders(self) -> tuple[Order, ...]:
+        """未約定注文一覧（章22.7 openOrders）。"""
+        self._require_address()
+        try:
+            response = await asyncio.to_thread(self.info.open_orders, self.address)
+        except Exception as e:
+            raise ExchangeError(f"Failed to fetch open orders: {e}") from e
+        return tuple(self._parse_order(order_data) for order_data in response)
+
+    @staticmethod
+    def _parse_order(order_data: dict[str, Any]) -> Order:
+        """SDK レスポンス1件を Order に変換。
+
+        HL の side は "B"（buy）/ "A"（ask=sell）。SDK 経路によっては
+        "buy"/"sell" 文字列の場合もあるため両対応。
+        tif は Alo/Ioc/Gtc 以外なら Gtc にフォールバック。
+        """
+        side_raw = order_data.get("side", "")
+        side: Literal["buy", "sell"] = "buy" if side_raw in ("B", "buy") else "sell"
+
+        tif_raw = order_data.get("orderType", "Gtc")
+        tif: Literal["Alo", "Ioc", "Gtc"] = (
+            tif_raw if tif_raw in ("Alo", "Ioc", "Gtc") else "Gtc"
+        )
+
+        return Order(
+            order_id=int(order_data.get("oid", 0)),
+            client_order_id=order_data.get("cloid"),
+            symbol=order_data.get("coin", ""),
+            side=side,
+            size=Decimal(str(order_data.get("sz", "0"))),
+            price=Decimal(str(order_data.get("limitPx", "0"))),
+            tif=tif,
+            timestamp_ms=int(order_data.get("timestamp", 0)),
+        )
+
+    async def get_fills(self, since_ms: int) -> tuple[Fill, ...]:
+        """約定履歴（章22.7 userFills・since_ms 以降）。"""
+        self._require_address()
+        try:
+            response = await asyncio.to_thread(
+                self.info.user_fills_by_time, self.address, since_ms
+            )
+        except Exception as e:
+            raise ExchangeError(f"Failed to fetch fills: {e}") from e
+
+        fills: list[Fill] = []
+        for fill_data in response:
+            side_raw = fill_data.get("side", "")
+            side: Literal["buy", "sell"] = (
+                "buy" if side_raw in ("B", "buy") else "sell"
+            )
+            fills.append(
+                Fill(
+                    order_id=int(fill_data.get("oid", 0)),
+                    symbol=fill_data.get("coin", ""),
+                    side=side,
+                    size=Decimal(str(fill_data.get("sz", "0"))),
+                    price=Decimal(str(fill_data.get("px", "0"))),
+                    fee_usd=Decimal(str(fill_data.get("fee", "0"))),
+                    timestamp_ms=int(fill_data.get("time", 0)),
+                    closed_pnl=Decimal(str(fill_data.get("closedPnl", "0"))),
+                )
+            )
+        return tuple(fills)
+
+    async def get_funding_payments(self, since_ms: int) -> tuple[FundingPayment, ...]:
+        """Funding精算履歴（章22.6・章22.7 userFundingHistory）。
+
+        SDK の delta.fundingRate は 1h レート。Protocol は 8h 相当値なので 8 倍する。
+        """
+        self._require_address()
+        try:
+            response = await asyncio.to_thread(
+                self.info.user_funding_history, self.address, since_ms
+            )
+        except Exception as e:
+            raise ExchangeError(f"Failed to fetch funding payments: {e}") from e
+
+        payments: list[FundingPayment] = []
+        for entry in response:
+            delta = entry.get("delta", {})
+            funding_1h = Decimal(str(delta.get("fundingRate", "0")))
+            payments.append(
+                FundingPayment(
+                    symbol=delta.get("coin", ""),
+                    funding_rate_8h=funding_1h * Decimal("8"),
+                    payment_usd=Decimal(str(delta.get("usdc", "0"))),
+                    timestamp_ms=int(entry.get("time", 0)),
+                )
+            )
+        return tuple(payments)
+
+    async def get_account_balance_usd(self) -> Decimal:
+        """口座残高（USDC・章22.7 marginSummary.accountValue）。"""
+        self._require_address()
+        try:
+            response = await asyncio.to_thread(self.info.user_state, self.address)
+        except Exception as e:
+            raise ExchangeError(f"Failed to fetch account balance: {e}") from e
+        margin_summary = response.get("marginSummary", {})
+        return Decimal(str(margin_summary.get("accountValue", "0")))
+
+    async def get_order_status(
+        self, order_id: int
+    ) -> Literal["pending", "filled", "cancelled", "rejected"]:
+        """注文ステータス取得（章22.7 orderStatus）。
+
+        HL のステータス文字列を Protocol の Literal に正規化する。
+        未知のステータスは "pending" にフォールバック（保守的）。
+        """
+        self._require_address()
+        try:
+            response = await asyncio.to_thread(
+                self.info.query_order_by_oid, self.address, order_id
+            )
+        except Exception as e:
+            raise ExchangeError(
+                f"Failed to fetch order status for {order_id}: {e}"
+            ) from e
+
+        order_data = response.get("order", {})
+        order_status_raw = order_data.get("status", "")
+        if order_status_raw in ("open", "triggered"):
+            return "pending"
+        if order_status_raw == "filled":
+            return "filled"
+        if order_status_raw in ("canceled", "cancelled"):
+            return "cancelled"
+        if order_status_raw == "rejected":
+            return "rejected"
+        return "pending"
+
+    async def get_order_by_client_id(self, client_order_id: str) -> Order | None:
+        """client_order_id で注文取得（章9.5 冪等性チェック）。
+
+        SDK に専用APIがないため、open_orders から線形検索。
+        """
+        orders = await self.get_open_orders()
+        for order in orders:
+            if order.client_order_id == client_order_id:
+                return order
+        return None

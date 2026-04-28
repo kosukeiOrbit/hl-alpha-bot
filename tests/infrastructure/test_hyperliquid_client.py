@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 from unittest.mock import MagicMock
 
@@ -658,6 +659,407 @@ class TestGetMarketSnapshot:
 
 
 # ────────────────────────────────────────────────
+# ユーザー状態系（PR6.3）
+# ────────────────────────────────────────────────
+
+
+_TEST_ADDR = "0x" + "1" * 40
+
+
+class TestRequireAddress:
+    def test_no_address_raises(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=None)
+        with pytest.raises(ExchangeError, match="address is required"):
+            client._require_address()
+
+    def test_with_address_passes(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._require_address()  # 例外を投げない
+
+    @pytest.mark.asyncio
+    async def test_get_positions_without_address_raises(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=None)
+        with pytest.raises(ExchangeError, match="address is required"):
+            await client.get_positions()
+
+
+class TestGetPositions:
+    @pytest.mark.asyncio
+    async def test_parses_long_position(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.user_state = MagicMock(
+            return_value={
+                "assetPositions": [
+                    {
+                        "position": {
+                            "coin": "BTC",
+                            "szi": "0.01",
+                            "entryPx": "65000",
+                            "unrealizedPnl": "5.5",
+                            "leverage": {"value": 3},
+                            "liquidationPx": "60000",
+                        }
+                    }
+                ],
+            }
+        )
+        positions = await client.get_positions()
+        assert len(positions) == 1
+        assert positions[0].symbol == "BTC"
+        assert positions[0].size == Decimal("0.01")
+        assert positions[0].entry_price == Decimal("65000")
+        assert positions[0].leverage == 3
+        assert positions[0].liquidation_price == Decimal("60000")
+
+    @pytest.mark.asyncio
+    async def test_parses_short_position(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.user_state = MagicMock(
+            return_value={
+                "assetPositions": [
+                    {
+                        "position": {
+                            "coin": "ETH",
+                            "szi": "-0.5",
+                            "entryPx": "3200",
+                            "unrealizedPnl": "10",
+                            "leverage": {"value": 2},
+                            "liquidationPx": None,
+                        }
+                    }
+                ],
+            }
+        )
+        positions = await client.get_positions()
+        assert positions[0].size < 0
+        assert positions[0].liquidation_price is None
+
+    @pytest.mark.asyncio
+    async def test_skips_zero_size(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.user_state = MagicMock(
+            return_value={
+                "assetPositions": [
+                    {
+                        "position": {
+                            "coin": "BTC",
+                            "szi": "0",
+                            "entryPx": "0",
+                            "unrealizedPnl": "0",
+                            "leverage": {"value": 1},
+                        }
+                    }
+                ],
+            }
+        )
+        assert await client.get_positions() == ()
+
+    @pytest.mark.asyncio
+    async def test_empty_positions(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.user_state = MagicMock(return_value={"assetPositions": []})
+        assert await client.get_positions() == ()
+
+    @pytest.mark.asyncio
+    async def test_no_assetPositions_key(self) -> None:
+        # response が空 dict のとき。
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.user_state = MagicMock(return_value={})
+        assert await client.get_positions() == ()
+
+    @pytest.mark.asyncio
+    async def test_sdk_error_propagates(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.user_state = MagicMock(side_effect=ConnectionError("timeout"))
+        with pytest.raises(ExchangeError, match="Failed to fetch positions"):
+            await client.get_positions()
+
+
+class TestGetOpenOrders:
+    @pytest.mark.asyncio
+    async def test_parses_orders(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.open_orders = MagicMock(
+            return_value=[
+                {
+                    "oid": 12345,
+                    "cloid": "test-cloid-1",
+                    "coin": "BTC",
+                    "side": "B",
+                    "sz": "0.01",
+                    "limitPx": "65000",
+                    "orderType": "Alo",
+                    "timestamp": 1700000000000,
+                },
+                {
+                    "oid": 12346,
+                    "cloid": None,
+                    "coin": "ETH",
+                    "side": "A",
+                    "sz": "0.5",
+                    "limitPx": "3200",
+                    "orderType": "Gtc",
+                    "timestamp": 1700000001000,
+                },
+            ]
+        )
+        orders = await client.get_open_orders()
+        assert len(orders) == 2
+        assert orders[0].order_id == 12345
+        assert orders[0].client_order_id == "test-cloid-1"
+        assert orders[0].side == "buy"
+        assert orders[0].tif == "Alo"
+        assert orders[1].side == "sell"
+        assert orders[1].client_order_id is None
+
+    @pytest.mark.asyncio
+    async def test_unknown_tif_defaults_to_gtc(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.open_orders = MagicMock(
+            return_value=[
+                {
+                    "oid": 1,
+                    "cloid": None,
+                    "coin": "BTC",
+                    "side": "B",
+                    "sz": "0.01",
+                    "limitPx": "65000",
+                    "orderType": "Unknown",
+                    "timestamp": 0,
+                }
+            ]
+        )
+        orders = await client.get_open_orders()
+        assert orders[0].tif == "Gtc"
+
+    @pytest.mark.asyncio
+    async def test_string_side_buy_sell(self) -> None:
+        # SDK 経路によって "buy"/"sell" 直接の場合にも対応。
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.open_orders = MagicMock(
+            return_value=[
+                {
+                    "oid": 1,
+                    "cloid": None,
+                    "coin": "BTC",
+                    "side": "buy",
+                    "sz": "0.01",
+                    "limitPx": "65000",
+                    "orderType": "Gtc",
+                    "timestamp": 0,
+                }
+            ]
+        )
+        orders = await client.get_open_orders()
+        assert orders[0].side == "buy"
+
+    @pytest.mark.asyncio
+    async def test_sdk_error_propagates(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.open_orders = MagicMock(side_effect=Exception("err"))
+        with pytest.raises(ExchangeError, match="Failed to fetch open orders"):
+            await client.get_open_orders()
+
+
+class TestGetFills:
+    @pytest.mark.asyncio
+    async def test_parses_fills(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.user_fills_by_time = MagicMock(
+            return_value=[
+                {
+                    "oid": 12345,
+                    "coin": "BTC",
+                    "side": "B",
+                    "sz": "0.01",
+                    "px": "65000",
+                    "fee": "0.5",
+                    "time": 1700000000000,
+                    "closedPnl": "0",
+                },
+                {
+                    "oid": 12346,
+                    "coin": "BTC",
+                    "side": "A",
+                    "sz": "0.01",
+                    "px": "65500",
+                    "fee": "0.5",
+                    "time": 1700001000000,
+                    "closedPnl": "5.0",
+                },
+            ]
+        )
+        fills = await client.get_fills(since_ms=1700000000000)
+        assert len(fills) == 2
+        assert fills[0].side == "buy"
+        assert fills[0].closed_pnl == Decimal("0")
+        assert fills[1].side == "sell"
+        assert fills[1].closed_pnl == Decimal("5.0")
+
+    @pytest.mark.asyncio
+    async def test_empty_fills(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.user_fills_by_time = MagicMock(return_value=[])
+        assert await client.get_fills(since_ms=0) == ()
+
+    @pytest.mark.asyncio
+    async def test_sdk_error_propagates(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.user_fills_by_time = MagicMock(
+            side_effect=ConnectionError("network")
+        )
+        with pytest.raises(ExchangeError, match="Failed to fetch fills"):
+            await client.get_fills(since_ms=0)
+
+
+class TestGetFundingPayments:
+    @pytest.mark.asyncio
+    async def test_converts_1h_rate_to_8h(self) -> None:
+        # SDK の delta.fundingRate は 1h → BOT は 8h 相当。
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.user_funding_history = MagicMock(
+            return_value=[
+                {
+                    "time": 1700000000000,
+                    "delta": {
+                        "coin": "BTC",
+                        "fundingRate": "0.0000125",
+                        "usdc": "-0.5",
+                    },
+                }
+            ]
+        )
+        payments = await client.get_funding_payments(since_ms=0)
+        assert len(payments) == 1
+        # 1h 0.0000125 → 8h 0.0001
+        assert payments[0].funding_rate_8h == Decimal("0.0001")
+        assert payments[0].payment_usd == Decimal("-0.5")
+        assert payments[0].symbol == "BTC"
+
+    @pytest.mark.asyncio
+    async def test_sdk_error_propagates(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.user_funding_history = MagicMock(side_effect=Exception("err"))
+        with pytest.raises(ExchangeError, match="Failed to fetch funding payments"):
+            await client.get_funding_payments(since_ms=0)
+
+
+class TestGetAccountBalance:
+    @pytest.mark.asyncio
+    async def test_returns_account_value(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.user_state = MagicMock(
+            return_value={"marginSummary": {"accountValue": "1234.56"}}
+        )
+        assert await client.get_account_balance_usd() == Decimal("1234.56")
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_when_empty(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.user_state = MagicMock(return_value={})
+        assert await client.get_account_balance_usd() == Decimal("0")
+
+    @pytest.mark.asyncio
+    async def test_sdk_error_propagates(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.user_state = MagicMock(side_effect=Exception("err"))
+        with pytest.raises(ExchangeError, match="Failed to fetch account balance"):
+            await client.get_account_balance_usd()
+
+
+class TestGetOrderStatus:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "hl_status, expected",
+        [
+            ("open", "pending"),
+            ("triggered", "pending"),
+            ("filled", "filled"),
+            ("canceled", "cancelled"),
+            ("cancelled", "cancelled"),
+            ("rejected", "rejected"),
+            ("unknown_status", "pending"),  # フォールバック
+        ],
+    )
+    async def test_status_mapping(self, hl_status: str, expected: str) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.query_order_by_oid = MagicMock(
+            return_value={"status": "order", "order": {"status": hl_status}}
+        )
+        result = await client.get_order_status(12345)
+        assert result == expected
+
+    @pytest.mark.asyncio
+    async def test_sdk_error_propagates(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.query_order_by_oid = MagicMock(side_effect=Exception("err"))
+        with pytest.raises(ExchangeError, match="Failed to fetch order status"):
+            await client.get_order_status(12345)
+
+
+class TestGetOrderByClientId:
+    @pytest.mark.asyncio
+    async def test_finds_matching_order(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.open_orders = MagicMock(
+            return_value=[
+                {
+                    "oid": 100,
+                    "cloid": "other-cloid",
+                    "coin": "BTC",
+                    "side": "B",
+                    "sz": "0.01",
+                    "limitPx": "65000",
+                    "orderType": "Alo",
+                    "timestamp": 0,
+                },
+                {
+                    "oid": 200,
+                    "cloid": "target-cloid",
+                    "coin": "ETH",
+                    "side": "B",
+                    "sz": "0.5",
+                    "limitPx": "3200",
+                    "orderType": "Alo",
+                    "timestamp": 0,
+                },
+            ]
+        )
+        order = await client.get_order_by_client_id("target-cloid")
+        assert order is not None
+        assert order.order_id == 200
+        assert order.client_order_id == "target-cloid"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_not_found(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.open_orders = MagicMock(return_value=[])
+        assert await client.get_order_by_client_id("missing") is None
+
+
+# ────────────────────────────────────────────────
 # E2E（testnet 実接続・デフォルト skip）
 # ────────────────────────────────────────────────
 
@@ -715,3 +1117,61 @@ class TestE2ETestnet:
         # APPLICATION 層で上書きされる前提のデフォルト
         assert snap.sentiment_score == 0.0
         assert snap.btc_ema_trend == "UPTREND"
+
+
+# ────────────────────────────────────────────────
+# E2E ユーザー状態系（PR6.3・testnet）
+# ────────────────────────────────────────────────
+
+
+@pytest.mark.e2e
+class TestE2EUserState:
+    """testnet で自分のアドレスに対して user 状態を取得するテスト。
+
+    HL_TESTNET_ADDRESS 環境変数が無ければ skip。
+    """
+
+    @pytest.fixture
+    def address(self) -> str:
+        import os
+
+        addr = os.getenv("HL_TESTNET_ADDRESS")
+        if not addr:
+            pytest.skip("HL_TESTNET_ADDRESS not set")
+        return addr
+
+    @pytest.mark.asyncio
+    async def test_get_account_balance(self, address: str) -> None:
+        client = HyperLiquidClient(network="testnet", address=address)
+        balance = await client.get_account_balance_usd()
+        assert balance >= Decimal("0")
+
+    @pytest.mark.asyncio
+    async def test_get_positions(self, address: str) -> None:
+        client = HyperLiquidClient(network="testnet", address=address)
+        positions = await client.get_positions()
+        assert isinstance(positions, tuple)
+        for pos in positions:
+            assert pos.symbol
+            assert pos.size != 0
+            assert pos.entry_price > 0
+
+    @pytest.mark.asyncio
+    async def test_get_open_orders(self, address: str) -> None:
+        client = HyperLiquidClient(network="testnet", address=address)
+        orders = await client.get_open_orders()
+        assert isinstance(orders, tuple)
+
+    @pytest.mark.asyncio
+    async def test_get_fills_recent(self, address: str) -> None:
+        client = HyperLiquidClient(network="testnet", address=address)
+        since_ms = int((datetime.now(UTC).timestamp() - 86400) * 1000)
+        fills = await client.get_fills(since_ms=since_ms)
+        assert isinstance(fills, tuple)
+
+    @pytest.mark.asyncio
+    async def test_get_funding_payments_recent(self, address: str) -> None:
+        client = HyperLiquidClient(network="testnet", address=address)
+        since_ms = int((datetime.now(UTC).timestamp() - 86400) * 1000)
+        payments = await client.get_funding_payments(since_ms=since_ms)
+        assert isinstance(payments, tuple)
