@@ -10,9 +10,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from src.core.models import EntryDecision
+
+if TYPE_CHECKING:
+    from src.adapters.exchange import Fill
 
 # ───────────────────────────────────────────────
 # データ構造（DB レコード）
@@ -174,6 +177,17 @@ class Repository(Protocol):
     ) -> None: ...
 
     async def mark_manual_review(self, trade_id: int) -> None: ...
+
+    # ─── PR7.3 reconciliation 用 ───
+    async def mark_resumed(self, trade_id: int) -> None:
+        """trade を再開済みフラグへ更新（章9.3 RESUME_MONITORING）。"""
+        ...
+
+    async def close_trade_from_fill(
+        self, trade_id: int, fill: Fill
+    ) -> None:
+        """BOT 停止中に約定した取引を fill から決済記録（章9.3 CLOSE_FROM_FILL）。"""
+        ...
 
     # ─── OI履歴（章13.5） ───
     async def record_oi(
