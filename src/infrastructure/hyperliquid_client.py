@@ -774,10 +774,20 @@ class HyperLiquidClient:
             raise RateLimitError(msg)
         raise OrderRejectedError(msg)
 
+    # ALO 拒否メッセージ判定。HL testnet 実機例:
+    #   "Post only order would have immediately matched, bbo was 76317@76332. asset=3"
+    # 将来の表記揺れに備えて複数パターンを許容。
+    _ALO_REJECT_MARKERS: ClassVar[tuple[str, ...]] = (
+        "post only",
+        "alo",
+        "would have matched",
+        "would have immediately matched",
+    )
+
     @staticmethod
     def _raise_inner_error(error_msg: str) -> None:
         lowered = error_msg.lower()
-        if "alo" in lowered or "would have matched" in lowered:
+        if any(m in lowered for m in HyperLiquidClient._ALO_REJECT_MARKERS):
             raise OrderRejectedError(error_msg, code="ALO_REJECT")
         if "duplicate" in lowered or "already" in lowered:
             raise DuplicateOrderError(error_msg)

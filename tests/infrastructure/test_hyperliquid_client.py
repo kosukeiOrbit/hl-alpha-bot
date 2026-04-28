@@ -1398,6 +1398,33 @@ class TestPlaceOrderALORejection:
             await client.place_order(_make_request())
         assert exc_info.value.code == "ALO_REJECT"
 
+    @pytest.mark.asyncio
+    async def test_alo_real_testnet_message_raises_rejected(self) -> None:
+        # HL testnet が実際に返すメッセージ（PR6.4.2 検証で判明）。
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {
+                        "statuses": [
+                            {
+                                "error": (
+                                    "Post only order would have immediately "
+                                    "matched, bbo was 76317@76332. asset=3"
+                                )
+                            }
+                        ]
+                    },
+                },
+            }
+        )
+        with pytest.raises(OrderRejectedError) as exc_info:
+            await client.place_order(_make_request())
+        assert exc_info.value.code == "ALO_REJECT"
+
 
 class TestPlaceOrderDuplicate:
     @pytest.mark.asyncio
