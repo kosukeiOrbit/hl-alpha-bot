@@ -8,12 +8,24 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.adapters.exchange import ExchangeError, L2Book, SymbolMeta
-from src.infrastructure.hyperliquid_client import HyperLiquidClient
+from src.adapters.exchange import (
+    DuplicateOrderError,
+    ExchangeError,
+    L2Book,
+    OrderRejectedError,
+    OrderRequest,
+    RateLimitError,
+    SymbolMeta,
+)
+from src.infrastructure.hyperliquid_client import (
+    HyperLiquidClient,
+    _generate_cloid,
+)
 
 # ────────────────────────────────────────────────
 # 初期化
@@ -1217,6 +1229,362 @@ class TestCancelOrder:
 
 
 # ────────────────────────────────────────────────
+# place_order ヘルパー（PR6.4.2）
+# ────────────────────────────────────────────────
+
+
+class TestBuildOrderType:
+    @pytest.mark.parametrize(
+        "tif, expected",
+        [
+            ("Alo", {"limit": {"tif": "Alo"}}),
+            ("Ioc", {"limit": {"tif": "Ioc"}}),
+            ("Gtc", {"limit": {"tif": "Gtc"}}),
+        ],
+    )
+    def test_valid_tif(self, tif: str, expected: dict[str, dict[str, str]]) -> None:
+        assert HyperLiquidClient._build_order_type(tif) == expected
+
+    def test_invalid_tif_raises(self) -> None:
+        with pytest.raises(ExchangeError, match="Unsupported tif"):
+            HyperLiquidClient._build_order_type("FOK")
+
+
+class TestGenerateCloid:
+    def test_format(self) -> None:
+        cloid = _generate_cloid()
+        assert cloid.startswith("0x")
+        assert len(cloid) == 34
+        # hex 文字のみ
+        int(cloid, 16)
+
+    def test_uniqueness(self) -> None:
+        cloids = {_generate_cloid() for _ in range(100)}
+        assert len(cloids) == 100
+
+
+# ────────────────────────────────────────────────
+# place_order（PR6.4.2・章22.4）
+# ────────────────────────────────────────────────
+
+
+def _make_request(**overrides: Any) -> OrderRequest:
+    base = {
+        "symbol": "BTC",
+        "side": "buy",
+        "size": Decimal("0.01"),
+        "price": Decimal("60000"),
+        "tif": "Alo",
+        "reduce_only": False,
+        "client_order_id": None,
+    }
+    base.update(overrides)
+    return OrderRequest(**base)  # type: ignore[arg-type]
+
+
+def _writeable_client() -> HyperLiquidClient:
+    c = HyperLiquidClient(
+        network="testnet",
+        address=_TEST_ADDR,
+        agent_private_key=_TEST_PRIV,
+    )
+    c._exchange = MagicMock()
+    return c
+
+
+class TestPlaceOrderResting:
+    @pytest.mark.asyncio
+    async def test_alo_buy_rests_on_book(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {"statuses": [{"resting": {"oid": 12345}}]},
+                },
+            }
+        )
+        cloid = "0x" + "f" * 32
+        result = await client.place_order(
+            _make_request(client_order_id=cloid, price=Decimal("60000"))
+        )
+        assert result.success is True
+        assert result.order_id == 12345
+
+        call_args = client._exchange.order.call_args
+        assert call_args[0][0] == "BTC"
+        assert call_args[0][1] is True
+        assert call_args[0][2] == 0.01
+        assert call_args[0][3] == 60000.0
+        assert call_args[0][4] == {"limit": {"tif": "Alo"}}
+        assert call_args[0][5] is False
+        # cloid は SDK の Cloid 型でラップされる
+        assert str(call_args[0][6]) == cloid
+
+    @pytest.mark.asyncio
+    async def test_sell_passes_is_buy_false(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {"statuses": [{"resting": {"oid": 1}}]},
+                },
+            }
+        )
+        await client.place_order(_make_request(side="sell"))
+        assert client._exchange.order.call_args[0][1] is False
+
+
+class TestPlaceOrderFilled:
+    @pytest.mark.asyncio
+    async def test_ioc_immediate_fill_returns_oid(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {
+                        "statuses": [
+                            {
+                                "filled": {
+                                    "totalSz": "0.01",
+                                    "avgPx": "65000",
+                                    "oid": 99999,
+                                }
+                            }
+                        ]
+                    },
+                },
+            }
+        )
+        result = await client.place_order(
+            _make_request(tif="Ioc", price=Decimal("70000"))
+        )
+        assert result.success is True
+        assert result.order_id == 99999
+
+
+class TestPlaceOrderALORejection:
+    @pytest.mark.asyncio
+    async def test_alo_would_match_raises_rejected(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {
+                        "statuses": [
+                            {
+                                "error": (
+                                    "Order would have matched immediately. "
+                                    "ALO rejected."
+                                )
+                            }
+                        ]
+                    },
+                },
+            }
+        )
+        with pytest.raises(OrderRejectedError) as exc_info:
+            await client.place_order(_make_request())
+        assert exc_info.value.code == "ALO_REJECT"
+
+
+class TestPlaceOrderDuplicate:
+    @pytest.mark.asyncio
+    async def test_duplicate_cloid_raises(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {
+                        "statuses": [
+                            {"error": "duplicate cloid: order already placed"}
+                        ]
+                    },
+                },
+            }
+        )
+        with pytest.raises(DuplicateOrderError):
+            await client.place_order(
+                _make_request(client_order_id="0x" + "f" * 32)
+            )
+
+
+class TestPlaceOrderRateLimit:
+    @pytest.mark.asyncio
+    async def test_top_level_err_too_many_requests(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(
+            return_value={"status": "err", "response": "Too many requests"}
+        )
+        with pytest.raises(RateLimitError):
+            await client.place_order(_make_request())
+
+    @pytest.mark.asyncio
+    async def test_top_level_err_rate_limited(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(
+            return_value={"status": "err", "response": "rate limit exceeded"}
+        )
+        with pytest.raises(RateLimitError):
+            await client.place_order(_make_request())
+
+    @pytest.mark.asyncio
+    async def test_top_level_err_other_raises_rejected(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(
+            return_value={"status": "err", "response": "insufficient balance"}
+        )
+        with pytest.raises(OrderRejectedError):
+            await client.place_order(_make_request())
+
+
+class TestPlaceOrderErrors:
+    @pytest.mark.asyncio
+    async def test_no_address_raises(self) -> None:
+        client = HyperLiquidClient(
+            network="testnet", address=None, agent_private_key=_TEST_PRIV
+        )
+        with pytest.raises(ExchangeError, match="address is required"):
+            await client.place_order(_make_request())
+
+    @pytest.mark.asyncio
+    async def test_no_private_key_raises(self) -> None:
+        client = HyperLiquidClient(
+            network="testnet", address=_TEST_ADDR, agent_private_key=None
+        )
+        with pytest.raises(ExchangeError, match="agent_private_key is required"):
+            await client.place_order(_make_request())
+
+    @pytest.mark.asyncio
+    async def test_sdk_exception_propagates_as_exchange_error(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(
+            side_effect=ConnectionError("network down")
+        )
+        with pytest.raises(ExchangeError, match="Failed to place order"):
+            await client.place_order(_make_request())
+
+    @pytest.mark.asyncio
+    async def test_no_statuses_raises(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {"type": "order", "data": {"statuses": []}},
+            }
+        )
+        with pytest.raises(ExchangeError, match="No statuses"):
+            await client.place_order(_make_request())
+
+    @pytest.mark.asyncio
+    async def test_unknown_top_status_raises(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(return_value={"status": "wat"})
+        with pytest.raises(ExchangeError, match="Unknown status"):
+            await client.place_order(_make_request())
+
+    @pytest.mark.asyncio
+    async def test_unexpected_status_format_raises(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {"type": "order", "data": {"statuses": [123]}},
+            }
+        )
+        with pytest.raises(ExchangeError, match="Unexpected status format"):
+            await client.place_order(_make_request())
+
+    @pytest.mark.asyncio
+    async def test_unrecognized_dict_raises(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {"statuses": [{"unknown_kind": {}}]},
+                },
+            }
+        )
+        with pytest.raises(ExchangeError, match="Unrecognized status"):
+            await client.place_order(_make_request())
+
+    @pytest.mark.asyncio
+    async def test_string_status_returns_success_without_oid(self) -> None:
+        # 古い SDK 互換: statuses[0] が "success" のような文字列。
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {"type": "order", "data": {"statuses": ["success"]}},
+            }
+        )
+        result = await client.place_order(_make_request())
+        assert result.success is True
+        assert result.order_id is None
+
+    @pytest.mark.asyncio
+    async def test_generic_inner_error_raises_rejected(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {"statuses": [{"error": "minimum size violated"}]},
+                },
+            }
+        )
+        with pytest.raises(OrderRejectedError):
+            await client.place_order(_make_request())
+
+
+class TestPlaceOrderAutoGenerateCloid:
+    @pytest.mark.asyncio
+    async def test_cloid_auto_generated_when_none(self) -> None:
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.order = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {"statuses": [{"resting": {"oid": 1}}]},
+                },
+            }
+        )
+        await client.place_order(_make_request(client_order_id=None))
+        cloid_passed = str(client._exchange.order.call_args[0][6])
+        assert cloid_passed.startswith("0x")
+        assert len(cloid_passed) == 34
+
+
+# ────────────────────────────────────────────────
 # E2E（testnet 実接続・デフォルト skip）
 # ────────────────────────────────────────────────
 
@@ -1369,3 +1737,82 @@ class TestE2ECancel:
     ) -> None:
         result = await client.cancel_order(order_id=999999999, symbol="BTC")
         assert result is False
+
+
+# ────────────────────────────────────────────────
+# E2E place_order（PR6.4.2・testnet 実発注）
+# ────────────────────────────────────────────────
+
+
+@pytest.mark.e2e
+class TestE2EPlaceOrder:
+    """testnet で実発注するテスト。実行: pytest -m e2e
+
+    実行条件:
+        HL_TESTNET_ADDRESS, HL_TESTNET_AGENT_KEY
+        testnet USDC 残高（最低 50 USDC 推奨）
+    """
+
+    @pytest.fixture
+    def client(self) -> HyperLiquidClient:
+        import os
+
+        addr = os.getenv("HL_TESTNET_ADDRESS")
+        key = os.getenv("HL_TESTNET_AGENT_KEY")
+        if not addr or not key:
+            pytest.skip("HL_TESTNET_ADDRESS or HL_TESTNET_AGENT_KEY not set")
+        return HyperLiquidClient(
+            network="testnet",
+            address=addr,
+            agent_private_key=key,
+        )
+
+    @pytest.mark.asyncio
+    async def test_alo_rest_then_cancel(self, client: HyperLiquidClient) -> None:
+        """ALO 注文を板に置いてからキャンセル。"""
+        book = await client.get_l2_book("BTC")
+        best_bid = book.bids[0].price
+        tick = await client.get_tick_size("BTC")
+        target_price = best_bid - tick * Decimal("10")
+
+        request = OrderRequest(
+            symbol="BTC",
+            side="buy",
+            size=Decimal("0.0001"),
+            price=target_price,
+            tif="Alo",
+        )
+
+        result = await client.place_order(request)
+        try:
+            assert result.success is True
+            assert result.order_id is not None
+            orders = await client.get_open_orders()
+            our_order = next(
+                (o for o in orders if o.order_id == result.order_id), None
+            )
+            assert our_order is not None
+            assert our_order.symbol == "BTC"
+        finally:
+            if result.order_id is not None:
+                await client.cancel_order(result.order_id, "BTC")
+
+    @pytest.mark.asyncio
+    async def test_alo_immediate_match_raises_rejected(
+        self, client: HyperLiquidClient
+    ) -> None:
+        """ALO で best_ask 以上に買い指値 → 即マッチして ALO 拒否。"""
+        book = await client.get_l2_book("BTC")
+        best_ask = book.asks[0].price
+        tick = await client.get_tick_size("BTC")
+        target_price = best_ask + tick * Decimal("10")
+
+        request = OrderRequest(
+            symbol="BTC",
+            side="buy",
+            size=Decimal("0.0001"),
+            price=target_price,
+            tif="Alo",
+        )
+        with pytest.raises(OrderRejectedError):
+            await client.place_order(request)

@@ -11,9 +11,9 @@
   get_funding_payments / get_account_balance_usd / get_order_status /
   get_order_by_client_id)
 - cancel_order / Exchange 初期化 (PR6.4.1)
+- place_order (PR6.4.2)
 
 未実装（後続PR）:
-- place_order（PR6.4.2）
 - place_trigger_order / place_orders_grouped（PR6.4.3）
 """
 
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, ClassVar, Literal
@@ -28,15 +29,21 @@ from typing import Any, ClassVar, Literal
 from eth_account import Account
 from hyperliquid.exchange import Exchange  # type: ignore[import-untyped]
 from hyperliquid.info import Info  # type: ignore[import-untyped]
+from hyperliquid.utils.types import Cloid  # type: ignore[import-untyped]
 
 from src.adapters.exchange import (
+    DuplicateOrderError,
     ExchangeError,
     Fill,
     FundingPayment,
     L2Book,
     L2BookLevel,
     Order,
+    OrderRejectedError,
+    OrderRequest,
+    OrderResult,
     Position,
+    RateLimitError,
     SymbolMeta,
 )
 from src.core.models import MarketSnapshot
@@ -664,3 +671,123 @@ class HyperLiquidClient:
 
         first = statuses[0]
         return not (isinstance(first, dict) and "error" in first)
+
+    async def place_order(self, request: OrderRequest) -> OrderResult:
+        """通常注文を発注（章22.4・PR6.4.2）。
+
+        Agent Wallet 秘密鍵で署名し、Master Wallet の口座で発注。
+        client_order_id を渡すと冪等性が確保される（章9.5）。
+        指定が無ければ UUID4 ベースの cloid を自動生成。
+
+        Args:
+            request: OrderRequest。
+
+        Returns:
+            OrderResult: 成功時は order_id 含む。
+
+        Raises:
+            OrderRejectedError: ALO拒否・通常拒否（残高不足等）。
+            DuplicateOrderError: 同一 client_order_id で発注済み。
+            RateLimitError: レート制限到達（章22.2）。
+            ExchangeError: address / agent_private_key 未設定、SDK 通信エラー等。
+        """
+        self._require_address()
+        if self.agent_private_key is None:
+            raise ExchangeError("agent_private_key is required for place_order")
+
+        is_buy = request.side == "buy"
+        order_type = self._build_order_type(request.tif)
+        cloid_str = request.client_order_id or _generate_cloid()
+        cloid_obj = Cloid.from_str(cloid_str)
+
+        try:
+            response = await asyncio.to_thread(
+                self.exchange.order,
+                request.symbol,
+                is_buy,
+                float(request.size),
+                float(request.price),
+                order_type,
+                request.reduce_only,
+                cloid_obj,
+            )
+        except Exception as e:
+            raise ExchangeError(
+                f"Failed to place order for {request.symbol}: {e}"
+            ) from e
+
+        return self._parse_order_response(response)
+
+    @staticmethod
+    def _build_order_type(tif: str) -> dict[str, dict[str, str]]:
+        """tif 文字列を SDK の order_type dict 形式に変換（章22.4）。
+
+        SDK 形式:
+        - {"limit": {"tif": "Alo"}}  → Post-Only
+        - {"limit": {"tif": "Ioc"}}  → Immediate-Or-Cancel
+        - {"limit": {"tif": "Gtc"}}  → Good-Till-Cancel
+        """
+        if tif not in ("Alo", "Ioc", "Gtc"):
+            raise ExchangeError(f"Unsupported tif: {tif}")
+        return {"limit": {"tif": tif}}
+
+    @staticmethod
+    def _parse_order_response(response: dict[str, Any]) -> OrderResult:
+        """SDK レスポンスを OrderResult に変換し、エラーを例外にマッピング。
+
+        想定レスポンス形式（章22.4）:
+        - 成功 (resting): {"status":"ok","response":{"type":"order",
+            "data":{"statuses":[{"resting":{"oid":12345}}]}}}
+        - 即約定 (filled): 同上 with {"filled":{"totalSz":..,"avgPx":..,"oid":..}}
+        - ALO拒否: 同上 with {"error":"Order would have matched..."}
+        - レート制限: {"status":"err","response":"Too many requests"}
+        """
+        top_status = response.get("status")
+        if top_status == "err":
+            HyperLiquidClient._raise_top_level_err(response)
+        if top_status != "ok":
+            raise ExchangeError(f"Unknown status: {top_status}")
+
+        statuses = response.get("response", {}).get("data", {}).get("statuses", [])
+        if not statuses:
+            raise ExchangeError(f"No statuses in response: {response}")
+
+        first = statuses[0]
+        # 古い SDK 互換: statuses[0] が "success" などの文字列。
+        if isinstance(first, str):
+            return OrderResult(success=True, order_id=None)
+        if not isinstance(first, dict):
+            raise ExchangeError(f"Unexpected status format: {first!r}")
+
+        if "error" in first:
+            HyperLiquidClient._raise_inner_error(str(first["error"]))
+        if "resting" in first:
+            return OrderResult(success=True, order_id=int(first["resting"]["oid"]))
+        if "filled" in first:
+            return OrderResult(success=True, order_id=int(first["filled"]["oid"]))
+        raise ExchangeError(f"Unrecognized status: {first!r}")
+
+    @staticmethod
+    def _raise_top_level_err(response: dict[str, Any]) -> None:
+        msg = str(response.get("response", "unknown"))
+        if "Too many requests" in msg or "rate" in msg.lower():
+            raise RateLimitError(msg)
+        raise OrderRejectedError(msg)
+
+    @staticmethod
+    def _raise_inner_error(error_msg: str) -> None:
+        lowered = error_msg.lower()
+        if "alo" in lowered or "would have matched" in lowered:
+            raise OrderRejectedError(error_msg, code="ALO_REJECT")
+        if "duplicate" in lowered or "already" in lowered:
+            raise DuplicateOrderError(error_msg)
+        raise OrderRejectedError(error_msg)
+
+
+def _generate_cloid() -> str:
+    """client_order_id を自動生成（章9.5）。
+
+    HL の cloid 仕様: 0x プレフィックス + 32 hex chars（16 バイト）。
+    UUID4.hex は 32 hex chars なので 0x を前置するだけで適合。
+    """
+    return "0x" + uuid.uuid4().hex
