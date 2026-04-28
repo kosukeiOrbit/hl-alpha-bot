@@ -10,9 +10,11 @@
 - ユーザー状態取得 (PR6.3: get_positions / get_open_orders / get_fills /
   get_funding_payments / get_account_balance_usd / get_order_status /
   get_order_by_client_id)
+- cancel_order / Exchange 初期化 (PR6.4.1)
 
 未実装（後続PR）:
-- 注文操作（PR6.4: place_order / cancel_order 等）
+- place_order（PR6.4.2）
+- place_trigger_order / place_orders_grouped（PR6.4.3）
 """
 
 from __future__ import annotations
@@ -23,6 +25,8 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, ClassVar, Literal
 
+from eth_account import Account
+from hyperliquid.exchange import Exchange  # type: ignore[import-untyped]
 from hyperliquid.info import Info  # type: ignore[import-untyped]
 
 from src.adapters.exchange import (
@@ -50,20 +54,30 @@ class HyperLiquidClient:
 
     MAINNET_INFO_URL = "https://api.hyperliquid.xyz"
     TESTNET_INFO_URL = "https://api.hyperliquid-testnet.xyz"
+    MAINNET_EXCHANGE_URL = "https://api.hyperliquid.xyz"
+    TESTNET_EXCHANGE_URL = "https://api.hyperliquid-testnet.xyz"
 
     def __init__(
         self,
         network: str = "testnet",
         address: str | None = None,
+        agent_private_key: str | None = None,
     ) -> None:
         if network not in ("mainnet", "testnet"):
             raise ValueError(f"network must be 'mainnet' or 'testnet', got {network!r}")
         self.network = network
         self.address = address
+        self.agent_private_key = agent_private_key
         self._info_url = (
             self.MAINNET_INFO_URL if network == "mainnet" else self.TESTNET_INFO_URL
         )
+        self._exchange_url = (
+            self.MAINNET_EXCHANGE_URL
+            if network == "mainnet"
+            else self.TESTNET_EXCHANGE_URL
+        )
         self._info: Info | None = None
+        self._exchange: Exchange | None = None
         self._symbols_cache: tuple[SymbolMeta, ...] | None = None
 
     @property
@@ -72,6 +86,31 @@ class HyperLiquidClient:
         if self._info is None:
             self._info = Info(base_url=self._info_url, skip_ws=True)
         return self._info
+
+    @property
+    def exchange(self) -> Exchange:
+        """公式SDK Exchange オブジェクト（lazy 初期化・署名用）。
+
+        Agent Wallet 秘密鍵で署名し、取引は Master Wallet（address）の
+        口座で行う（章10.4 Agent Wallet モデル）。
+        """
+        if self._exchange is None:
+            if self.agent_private_key is None:
+                raise ExchangeError(
+                    "agent_private_key is required for write operations. "
+                    "Pass agent_private_key to HyperLiquidClient."
+                )
+            if self.address is None:
+                raise ExchangeError(
+                    "address (master) is required for write operations."
+                )
+            account = Account.from_key(self.agent_private_key)
+            self._exchange = Exchange(
+                wallet=account,
+                base_url=self._exchange_url,
+                account_address=self.address,
+            )
+        return self._exchange
 
     # ─── 銘柄メタ情報 ───
 
@@ -582,3 +621,46 @@ class HyperLiquidClient:
             if order.client_order_id == client_order_id:
                 return order
         return None
+
+    # ─── 注文操作（PR6.4・章22.4） ───
+
+    async def cancel_order(self, order_id: int, symbol: str) -> bool:
+        """注文キャンセル（章22.4）。
+
+        Agent Wallet 秘密鍵で署名し、Master Wallet の口座で発注をキャンセル。
+
+        Args:
+            order_id: HL の oid。
+            symbol: 銘柄名（例: "BTC"）。SDK は coin 名を期待する。
+
+        Returns:
+            True: キャンセル成功。
+            False: キャンセル失敗（既に約定済み・キャンセル済み・存在しない等）。
+
+        Raises:
+            ExchangeError: address / agent_private_key 未設定、SDK 呼び出し失敗。
+        """
+        self._require_address()
+        if self.agent_private_key is None:
+            raise ExchangeError("agent_private_key is required for cancel_order")
+
+        try:
+            response = await asyncio.to_thread(self.exchange.cancel, symbol, order_id)
+        except Exception as e:
+            raise ExchangeError(f"Failed to cancel order {order_id}: {e}") from e
+
+        # SDK レスポンス例（章22.4）:
+        #   成功: {"status":"ok","response":{"type":"cancel",
+        #           "data":{"statuses":["success"]}}}
+        #   失敗: {"status":"ok","response":{"type":"cancel",
+        #           "data":{"statuses":[{"error":"..."}]}}}
+        #   API err: {"status":"err","response":"..."}
+        if response.get("status") != "ok":
+            return False
+
+        statuses = response.get("response", {}).get("data", {}).get("statuses", [])
+        if not statuses:
+            return False
+
+        first = statuses[0]
+        return not (isinstance(first, dict) and "error" in first)

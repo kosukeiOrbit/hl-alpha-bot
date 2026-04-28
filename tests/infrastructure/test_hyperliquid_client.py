@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -51,6 +51,23 @@ class TestInitialization:
         assert client._info is info  # 同じインスタンス
         # 2回目は同じ
         assert client.info is info
+
+    def test_agent_private_key_default_none(self) -> None:
+        client = HyperLiquidClient()
+        assert client.agent_private_key is None
+        assert client._exchange is None
+
+    def test_agent_private_key_can_be_set(self) -> None:
+        client = HyperLiquidClient(agent_private_key="0x" + "1" * 64)
+        assert client.agent_private_key == "0x" + "1" * 64
+
+    def test_mainnet_exchange_url(self) -> None:
+        client = HyperLiquidClient(network="mainnet")
+        assert client._exchange_url == HyperLiquidClient.MAINNET_EXCHANGE_URL
+
+    def test_testnet_exchange_url(self) -> None:
+        client = HyperLiquidClient(network="testnet")
+        assert client._exchange_url == HyperLiquidClient.TESTNET_EXCHANGE_URL
 
 
 # ────────────────────────────────────────────────
@@ -1060,6 +1077,146 @@ class TestGetOrderByClientId:
 
 
 # ────────────────────────────────────────────────
+# Exchange プロパティ（PR6.4.1）
+# ────────────────────────────────────────────────
+
+
+_TEST_PRIV = "0x" + "1" * 64
+
+
+class TestExchangeProperty:
+    def test_requires_private_key(self) -> None:
+        client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
+        with pytest.raises(ExchangeError, match="agent_private_key is required"):
+            _ = client.exchange
+
+    def test_requires_address(self) -> None:
+        client = HyperLiquidClient(network="testnet", agent_private_key=_TEST_PRIV)
+        with pytest.raises(ExchangeError, match=r"address.*required"):
+            _ = client.exchange
+
+    def test_lazy_init_calls_sdk_with_correct_args(self) -> None:
+        client = HyperLiquidClient(
+            network="testnet",
+            address=_TEST_ADDR,
+            agent_private_key=_TEST_PRIV,
+        )
+        assert client._exchange is None
+
+        with (
+            patch("src.infrastructure.hyperliquid_client.Exchange") as mock_exchange,
+            patch("src.infrastructure.hyperliquid_client.Account") as mock_account,
+        ):
+            mock_account.from_key = MagicMock(return_value="signer-account")
+            mock_exchange.return_value = MagicMock()
+            ex = client.exchange
+
+            mock_account.from_key.assert_called_once_with(_TEST_PRIV)
+            mock_exchange.assert_called_once_with(
+                wallet="signer-account",
+                base_url=HyperLiquidClient.TESTNET_EXCHANGE_URL,
+                account_address=_TEST_ADDR,
+            )
+            # 2回目は同じインスタンスを返す（再初期化しない）
+            assert client.exchange is ex
+            mock_exchange.assert_called_once()
+
+
+# ────────────────────────────────────────────────
+# cancel_order（PR6.4.1・章22.4）
+# ────────────────────────────────────────────────
+
+
+class TestCancelOrder:
+    def _client(self) -> HyperLiquidClient:
+        c = HyperLiquidClient(
+            network="testnet",
+            address=_TEST_ADDR,
+            agent_private_key=_TEST_PRIV,
+        )
+        c._exchange = MagicMock()
+        return c
+
+    @pytest.mark.asyncio
+    async def test_cancel_success(self) -> None:
+        client = self._client()
+        assert client._exchange is not None
+        client._exchange.cancel = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "cancel",
+                    "data": {"statuses": ["success"]},
+                },
+            }
+        )
+        assert await client.cancel_order(order_id=12345, symbol="BTC") is True
+        client._exchange.cancel.assert_called_once_with("BTC", 12345)
+
+    @pytest.mark.asyncio
+    async def test_cancel_returns_false_on_inner_error(self) -> None:
+        client = self._client()
+        assert client._exchange is not None
+        client._exchange.cancel = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "cancel",
+                    "data": {
+                        "statuses": [{"error": "Order was already canceled"}],
+                    },
+                },
+            }
+        )
+        assert await client.cancel_order(order_id=999, symbol="BTC") is False
+
+    @pytest.mark.asyncio
+    async def test_cancel_returns_false_on_status_err(self) -> None:
+        client = self._client()
+        assert client._exchange is not None
+        client._exchange.cancel = MagicMock(
+            return_value={"status": "err", "response": "Too many requests"}
+        )
+        assert await client.cancel_order(order_id=12345, symbol="BTC") is False
+
+    @pytest.mark.asyncio
+    async def test_cancel_returns_false_on_empty_statuses(self) -> None:
+        client = self._client()
+        assert client._exchange is not None
+        client._exchange.cancel = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {"type": "cancel", "data": {"statuses": []}},
+            }
+        )
+        assert await client.cancel_order(order_id=12345, symbol="BTC") is False
+
+    @pytest.mark.asyncio
+    async def test_cancel_sdk_exception_raises_exchange_error(self) -> None:
+        client = self._client()
+        assert client._exchange is not None
+        client._exchange.cancel = MagicMock(side_effect=ConnectionError("timeout"))
+        with pytest.raises(ExchangeError, match="Failed to cancel order"):
+            await client.cancel_order(order_id=12345, symbol="BTC")
+
+    @pytest.mark.asyncio
+    async def test_cancel_without_address_raises(self) -> None:
+        client = HyperLiquidClient(
+            network="testnet", address=None, agent_private_key=_TEST_PRIV
+        )
+        with pytest.raises(ExchangeError, match="address is required"):
+            await client.cancel_order(order_id=12345, symbol="BTC")
+
+    @pytest.mark.asyncio
+    async def test_cancel_without_private_key_raises(self) -> None:
+        client = HyperLiquidClient(
+            network="testnet", address=_TEST_ADDR, agent_private_key=None
+        )
+        with pytest.raises(ExchangeError, match="agent_private_key is required"):
+            await client.cancel_order(order_id=12345, symbol="BTC")
+
+
+# ────────────────────────────────────────────────
 # E2E（testnet 実接続・デフォルト skip）
 # ────────────────────────────────────────────────
 
@@ -1175,3 +1332,40 @@ class TestE2EUserState:
         since_ms = int((datetime.now(UTC).timestamp() - 86400) * 1000)
         payments = await client.get_funding_payments(since_ms=since_ms)
         assert isinstance(payments, tuple)
+
+
+# ────────────────────────────────────────────────
+# E2E cancel_order（PR6.4.1・testnet 実署名）
+# ────────────────────────────────────────────────
+
+
+@pytest.mark.e2e
+class TestE2ECancel:
+    """testnet で Agent Wallet 署名 → 存在しない order_id を cancel → False。
+
+    実行条件:
+        HL_TESTNET_ADDRESS （Master Wallet）
+        HL_TESTNET_AGENT_KEY （Agent Wallet 秘密鍵）
+    どちらか欠けていれば skip。
+    """
+
+    @pytest.fixture
+    def client(self) -> HyperLiquidClient:
+        import os
+
+        addr = os.getenv("HL_TESTNET_ADDRESS")
+        key = os.getenv("HL_TESTNET_AGENT_KEY")
+        if not addr or not key:
+            pytest.skip("HL_TESTNET_ADDRESS or HL_TESTNET_AGENT_KEY not set")
+        return HyperLiquidClient(
+            network="testnet",
+            address=addr,
+            agent_private_key=key,
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancel_nonexistent_order_returns_false(
+        self, client: HyperLiquidClient
+    ) -> None:
+        result = await client.cancel_order(order_id=999999999, symbol="BTC")
+        assert result is False
