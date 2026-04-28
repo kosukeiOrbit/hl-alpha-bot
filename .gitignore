@@ -12,6 +12,11 @@ secrets/secrets.yaml
 !secrets/.age-key.example
 !secrets/.gitignore
 
+# 念のための秘密鍵パターン（generate_agent_wallet.py の出力等）
+*.key
+*.pem
+agent_wallet_*.txt
+
 # ============================================
 # データ・ログ（ローカル）
 # ============================================
