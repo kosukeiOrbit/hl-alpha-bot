@@ -53,7 +53,7 @@ async def main() -> None:
     request = OrderRequest(
         symbol="BTC",
         side="buy",
-        size=Decimal("0.0001"),
+        size=Decimal("0.0002"),
         price=target_price,
         tif="Alo",
     )
@@ -85,7 +85,7 @@ async def main() -> None:
     bad_request = OrderRequest(
         symbol="BTC",
         side="buy",
-        size=Decimal("0.0001"),
+        size=Decimal("0.0002"),
         price=bad_price,
         tif="Alo",
     )
