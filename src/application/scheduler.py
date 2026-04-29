@@ -131,10 +131,16 @@ class Scheduler:
             try:
                 stats = await self.run_cycle_once()
                 logger.info(
-                    "cycle done filled=%d closed=%d entries=%d duration=%.2fs",
+                    "cycle done filled=%d closed=%d "
+                    "attempts=%d executed=%d dryrun=%d errors=%d "
+                    "cb=%s duration=%.2fs",
                     stats.monitor_filled,
                     stats.monitor_closed,
+                    stats.entry_attempts,
                     stats.entry_executed,
+                    stats.entry_dryrun,
+                    stats.entry_errors,
+                    "active" if stats.circuit_breaker_active else "off",
                     stats.duration_seconds,
                 )
             except Exception:

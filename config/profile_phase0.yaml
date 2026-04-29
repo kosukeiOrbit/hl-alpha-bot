@@ -1,5 +1,11 @@
 # Phase 0 プロファイル — settings.yaml の上書き
-# dry_run 強制・LONG のみ・小サイズ。
+# dry_run 強制・LONG のみ・小サイズ・SENTIMENT は強制 bullish。
+#
+# SENTIMENT を強制 bullish にする理由:
+#   Phase 0 は signal の出方を観察するモード。
+#   FixedSentimentProvider が neutral だと SENTIMENT 層で常に弾かれて
+#   4層 AND が成立せず、MOMENTUM/REGIME の現実の通過率を観察できない。
+#   dry_run なので実発注リスクはゼロ。
 
 phase: phase_0
 
@@ -10,3 +16,8 @@ trading:
 watchlist:
   directions:
     - LONG
+
+sentiment:
+  fixed_score: 0.8                              # CORE LONG 閾値 0.6 を超える
+  fixed_confidence: 0.9                         # CORE confidence 閾値 0.7 を超える
+  reasoning: "Phase 0 forced bullish for observation"
