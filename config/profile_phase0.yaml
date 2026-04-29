@@ -1,0 +1,12 @@
+# Phase 0 プロファイル — settings.yaml の上書き
+# dry_run 強制・LONG のみ・小サイズ。
+
+phase: phase_0
+
+trading:
+  is_dry_run: true       # 必ず true（観察モード）
+  position_size_pct: 0.01 # Phase 0 は 1% に絞る
+
+watchlist:
+  directions:
+    - LONG

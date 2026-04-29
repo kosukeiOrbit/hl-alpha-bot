@@ -1,0 +1,94 @@
+# hl-alpha-bot 基本設定（全環境共通）
+# プロファイル（profile_*.yaml）が必要な部分を上書きする。
+# フィールド名は src/application/*.py の Config dataclass 実体と一致する。
+
+phase: phase_0   # phase_0 / phase_1 / phase_2 / phase_3 / phase_4
+
+# ───────────────────────────────────────────────
+# Exchange 接続
+# ───────────────────────────────────────────────
+exchange:
+  network: testnet   # testnet / mainnet
+
+# ───────────────────────────────────────────────
+# 取引設定（EntryFlowConfig 実体に対応）
+# ───────────────────────────────────────────────
+trading:
+  is_dry_run: true
+  leverage: 3
+  flow_layer_enabled: false   # WS trades 未実装なので bypass（章11.6.3）
+  position_size_pct: 0.05     # 口座の 5%
+  sl_atr_mult: 1.5
+  tp_atr_mult: 3.0
+
+# ───────────────────────────────────────────────
+# ウォッチリスト（章12）
+# ───────────────────────────────────────────────
+watchlist:
+  fixed:
+    - BTC
+    - ETH
+  directions:
+    - LONG
+    # - SHORT   # Phase 0 は LONG のみ
+
+# ───────────────────────────────────────────────
+# Sentiment（PR7.5b ダミー実装）
+# ───────────────────────────────────────────────
+sentiment:
+  fixed_score: 0.0
+  fixed_confidence: 0.5
+  reasoning: "Phase 0 fixed value"
+
+# ───────────────────────────────────────────────
+# ストレージ
+# ───────────────────────────────────────────────
+storage:
+  db_path: "data/hl_bot.db"
+
+# ───────────────────────────────────────────────
+# Scheduler（SchedulerConfig 実体に対応）
+# ───────────────────────────────────────────────
+scheduler:
+  cycle_interval_seconds: 10.0
+  reconcile_interval_seconds: 300.0
+  circuit_breaker_enabled: true
+  max_position_count: 5
+  daily_loss_limit_pct: 3.0
+  weekly_loss_limit_pct: 8.0
+  consecutive_loss_limit: 3
+  flash_crash_threshold_pct: 5.0
+  btc_anomaly_threshold_pct: 3.0
+  api_error_rate_max: 0.30
+  position_overflow_multiplier: 1.5
+
+# ───────────────────────────────────────────────
+# Position Monitor（PositionMonitorConfig 実体に対応）
+# ───────────────────────────────────────────────
+position_monitor:
+  funding_close_enabled: true
+  funding_close_minutes_before: 5
+  fills_lookback_seconds: 300
+  force_close_slippage_tolerance_pct: 0.005
+
+# ───────────────────────────────────────────────
+# Reconciliation（ReconciliationConfig 実体に対応）
+# ───────────────────────────────────────────────
+reconciliation:
+  fills_lookback_hours: 24
+  stale_order_cleanup_seconds: 30
+
+# ───────────────────────────────────────────────
+# Entry Flow（EntryFlowConfig の OI 関連）
+# ───────────────────────────────────────────────
+entry_flow:
+  oi_lookup_tolerance_minutes: 5
+
+# ───────────────────────────────────────────────
+# ロギング（章26）
+# ───────────────────────────────────────────────
+logging:
+  level: INFO
+  log_file: "logs/bot.log"
+  rotation_when: midnight
+  rotation_backup_count: 30
