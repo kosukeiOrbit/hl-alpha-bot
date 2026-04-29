@@ -1083,6 +1083,33 @@ CREATE TABLE sentiment_logs (
 - スコアと実損益の相関を月次で再評価
 - プロンプトの調整根拠データになる
 
+### 7.10 PR7.5b 実装で確定した SentimentResult 仕様
+
+PR7.5b (FixedSentimentProvider) で `SentimentResult` の実型を確認した結果：
+
+```python
+@dataclass(frozen=True)
+class SentimentResult:
+    score: Decimal       # 範囲 [-1, 1]
+    confidence: Decimal  # 範囲 [0, 1]
+    direction: Literal["bullish", "bearish", "neutral"]
+    reasoning: str
+    source_count: int
+    cached: bool
+```
+
+- `score` は **`[-1, 1]`** 範囲（仕様書本文で曖昧だった部分の確定）
+  - `-1.0` 〜 `-0.3` : bearish 寄り
+  - `-0.3` 〜 `+0.6` : neutral
+  - `+0.6` 〜 `+1.0` : bullish 寄り
+- 1 つのスコアで LONG/SHORT 両方向を表現（符号で方向、絶対値で強さ）
+- `direction` の判定は CORE 層 entry_judge と整合させる（章 11.4）：
+  - `score > 0.6` AND `confidence > 0.7` → LONG SENTIMENT 通過
+  - `score < -0.3` AND `confidence > 0.7` → SHORT SENTIMENT 通過
+
+`fetch_sources` / `judge` / `judge_cached_or_fresh` の 3 メソッドを揃えて
+`SentimentProvider` Protocol を満たす。
+
 ---
 
 ## 8. データロギング設計（DB主体 + CSVエクスポート）
@@ -1635,6 +1662,88 @@ GROUP BY month;
 | スキーマ進化 | カラム追加困難 | 同左 | **ALTER TABLEで安全** |
 | 自動CSV出力 | プライマリ | プライマリ | **エクスポート（補助）** |
 | バックアップ | 手動 | 手動 | **日次自動** |
+
+### 8.15 PR7.5a 実装で確定した事項
+
+PR7.5a (SQLiteRepository 実装) で確定した、設計書記述と実装の差分。
+
+#### 8.15.1 schema.sql の配置と適用
+
+```
+src/infrastructure/migrations/schema.sql
+```
+
+- `migrations/` 配下に配置
+- 全テーブル `CREATE TABLE IF NOT EXISTS` で冪等
+- `schema_version` テーブルを併設（将来のマイグレーション用）
+- `SQLiteRepository.initialize()` で `executescript` 一発適用
+
+#### 8.15.2 trades テーブルの追加フィールド（PR7.2/7.3 の状態管理用）
+
+章 8.2 の trades テーブル DDL に以下のフィールドが実装で追加されている：
+
+| フィールド | 型 | 用途 | 出所 |
+|---|---|---|---|
+| `is_filled` | INTEGER (0/1) | entry 約定済みフラグ | PR7.2 |
+| `actual_entry_price` | REAL | 実約定価格（指定価格と異なり得る） | PR7.2 |
+| `tp_order_id` / `sl_order_id` | TEXT | grouped 発注後に紐付けられる HL OID | PR7.2・章 14.6 |
+| `is_external` | INTEGER (0/1) | 外部発生（手動取引等）フラグ | PR7.3・章 9.3 |
+| `resumed_at` | DATETIME | 再開済みマーク時刻 | PR7.3・章 9.3 |
+| `is_manual_review` | INTEGER (0/1) | 手動確認要フラグ | PR7.3・章 9.3 |
+| `fill_time` | DATETIME | entry 約定検知時刻 | PR7.2・章 14.6 |
+| `vwap_metrics` | TEXT (JSON) | 章 6 VWAP State の JSON 保存 | PR7.5a |
+
+#### 8.15.3 balance_history テーブル（新規）
+
+口座残高スナップショットを記録（章 10.5 / 13.5 / 15.4 サマリー用）：
+
+```sql
+CREATE TABLE IF NOT EXISTS balance_history (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp     DATETIME NOT NULL,
+    balance_usd   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_balance_history_time
+    ON balance_history(timestamp);
+```
+
+`Repository.record_balance_snapshot(timestamp, balance_usd)` で記録、
+`Repository.get_account_balance_history(days)` で参照。
+
+#### 8.15.4 incidents テーブル（章 9.11 ∋ 詳細化）
+
+章 9.11 で言及していた障害ログテーブルを実装で具体化：
+
+```sql
+CREATE TABLE IF NOT EXISTS incidents (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp   DATETIME NOT NULL,
+    severity    TEXT NOT NULL,    -- INFO / WARNING / ERROR / CRITICAL
+    event       TEXT NOT NULL,    -- イベント種別キー
+    details     TEXT NOT NULL     -- JSON
+);
+```
+
+`Repository.log_incident(IncidentLog)` で記録。
+
+#### 8.15.5 Decimal の保存方針
+
+SQLite は Decimal をネイティブサポートしないため、REAL（float）として保存し
+読み出し時に `Decimal(str(row[...]))` で復元する。トレード規模なら 15 桁精度で
+十分。等値比較や厳密な金額計算は CORE 層側 (Decimal) で行う。
+
+#### 8.15.6 datetime の保存方針
+
+ISO8601 文字列で保存。tzinfo がない datetime は UTC とみなして付与する：
+
+```python
+def _dt_iso(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.isoformat()
+```
 
 ---
 
@@ -2215,6 +2324,82 @@ async def emergency_stop(close_all: bool = False):
 | 障害ログDB | なし | なし | **incidents テーブル** |
 | 緊急停止コマンド | なし | なし | **手動 + Discord** |
 | データ準備チェック | なし | なし | **DataReadinessGate** |
+
+### 9.15 PR7.3 / PR7.4 実装で確定した事項
+
+#### 9.15.1 ReconcileAction の実装名（章 9.3 補強）
+
+CORE 層の関数名と type 列挙体は実装で以下に確定：
+
+```python
+# src/core/reconciliation.py
+class ActionType(StrEnum):
+    REGISTER_EXTERNAL = "REGISTER_EXTERNAL"
+    RESUME_MONITORING = "RESUME_MONITORING"
+    CORRECT_DB        = "CORRECT_DB"
+    CLOSE_FROM_FILL   = "CLOSE_FROM_FILL"
+    MANUAL_REVIEW     = "MANUAL_REVIEW"
+```
+
+Repository 側のメソッド名は **`correct_position`**（仕様書本文の `update_position` は誤り）。
+シグネチャ：
+
+```python
+async def correct_position(
+    self, trade_id: int, actual_size: Decimal, actual_entry: Decimal
+) -> None: ...
+```
+
+`register_external_position` は新規 trade を作って `int`（trade_id）を返す。
+
+#### 9.15.2 CORE と ADAPTERS の Fill 型差異と復元（章 9.3 補強）
+
+CORE 層の `HLFill` には `closed_pnl` / `fee_usd` がない（突合判定に最小データ）。
+APPLICATION 層の `_close_from_fill` で元の ADAPTERS `Fill` を症候的にマッチして取り戻す：
+
+```python
+def _find_adapter_fill(
+    hl_fill: HLFill, adapter_fills: tuple[Fill, ...]
+) -> Fill | None:
+    for f in adapter_fills:
+        if (f.symbol == hl_fill.symbol
+                and f.side == hl_fill.side
+                and f.size == hl_fill.size
+                and f.price == hl_fill.price
+                and f.timestamp_ms == hl_fill.timestamp):
+            return f
+    return None
+```
+
+#### 9.15.3 run_periodic_check の実装（章 9.6 補強）
+
+`restore_on_startup` と `run_periodic_check` は内部で同じ `_reconcile` ヘルパーを呼び、
+スイッチ引数で挙動を変える：
+
+```python
+async def restore_on_startup(self) -> ReconcileSummary:
+    return await self._reconcile(cleanup_enabled=True, notify_completion=True)
+
+async def run_periodic_check(self) -> ReconcileSummary:
+    return await self._reconcile(cleanup_enabled=False, notify_completion=False)
+```
+
+定期実行モードでは stale order cleanup を行わず、完了 signal も送らない。
+差分があった場合のみ alert で通知する。
+
+#### 9.15.4 CircuitBreaker CORE 実装の名前（章 9.7 補強）
+
+CORE 層の実装は以下の名前で確定。仕様書本文と乖離していた箇所の正しい呼称：
+
+| 仕様書本文の名前 | CORE 実装の実体 |
+|---|---|
+| `CircuitBreakerInputs` | `BreakerInput`（単数形） |
+| `check_all_breakers` | `check_circuit_breaker` |
+| `result.is_active` | `result.triggered` |
+| `result.active_reasons`（複数） | `result.reason`（単一・最初の発動のみ） |
+
+`check_circuit_breaker` は **最初に発動した 1 つだけ**を返す（複数同時発動は表現しない）。
+レイヤー優先度は順序で表現される（DAILY_LOSS > WEEKLY_LOSS > CONSECUTIVE_LOSS > ...）。
 
 ---
 
@@ -3548,6 +3733,166 @@ hl-alpha-bot を以下の方針で実装してください：
 | E2E分離 | なし | なし | **testnet・手動のみ** |
 | 開発フロー | 動かしながら修正 | 動かしながら修正 | **TDD: Red→Green→Refactor** |
 
+### 11.16 PR7.x 実装で確定した APPLICATION 層 Config 仕様
+
+PR7.1 〜 PR7.5c の実装で各 Config dataclass のフィールドが確定。
+本文中で散発していた仮置きフィールド名と乖離しているので、ここで**唯一の真実**として整理する。
+
+#### 11.16.1 EntryFlowConfig（PR7.1）
+
+```python
+@dataclass(frozen=True)
+class EntryFlowConfig:
+    is_dry_run: bool
+    leverage: int
+    flow_layer_enabled: bool
+    position_size_pct: Decimal           # 章 13.2 SizingInput と同名
+    sl_atr_mult: Decimal
+    tp_atr_mult: Decimal
+    oi_lookup_tolerance_minutes: int
+```
+
+仕様書本文との差分:
+- ❌ `risk_per_trade_pct` は存在しない → ✅ `position_size_pct`
+- ❌ `max_position_usd` は EntryFlowConfig に持たない（CORE position_sizer の引数として注入）
+- ❌ `consecutive_losses_threshold` / `losing_streak_size_multiplier` も同様に持たない
+
+#### 11.16.2 PositionMonitorConfig（PR7.2）
+
+```python
+@dataclass(frozen=True)
+class PositionMonitorConfig:
+    funding_close_minutes_before: int
+    funding_close_enabled: bool
+    fills_lookback_seconds: int
+    force_close_slippage_tolerance_pct: Decimal
+```
+
+#### 11.16.3 ReconciliationConfig（PR7.3）
+
+```python
+@dataclass(frozen=True)
+class ReconciliationConfig:
+    fills_lookback_hours: int
+    stale_order_cleanup_seconds: int
+```
+
+仕様書本文との差分:
+- ❌ `enable_stale_order_cleanup` フィールドは存在しない
+  → cleanup の有無は `restore_on_startup` (有効) vs `run_periodic_check` (無効) の
+    呼び出し側スイッチで制御（章 9.6）
+
+#### 11.16.4 SchedulerConfig（PR7.4）
+
+```python
+@dataclass(frozen=True)
+class SchedulerConfig:
+    watchlist: tuple[str, ...]
+    directions: tuple[Literal["LONG", "SHORT"], ...]
+    cycle_interval_seconds: float
+    reconcile_interval_seconds: float
+    circuit_breaker_enabled: bool
+    max_position_count: int
+    daily_loss_limit_pct: Decimal
+    weekly_loss_limit_pct: Decimal
+    consecutive_loss_limit: int
+    flash_crash_threshold_pct: Decimal
+    btc_anomaly_threshold_pct: Decimal
+    api_error_rate_max: Decimal
+    position_overflow_multiplier: Decimal
+```
+
+仕様書本文との差分:
+- ❌ `shutdown_timeout_seconds` フィールドは存在しない
+  → graceful shutdown は `_shutdown_requested` フラグで cycle 完了を待つだけ
+
+### 11.17 PR7.x 実装で確定した APPLICATION 層実装方針
+
+#### 11.17.1 FLOW bypass は APPLICATION 層に集約（PR7.1・章 11.6.3 補強）
+
+CORE 層 `judge_long_entry` / `judge_short_entry` は config 引数を持たない純関数のまま維持。
+FLOW bypass は APPLICATION 層 `EntryFlow._bypass_flow` で処理する：
+
+```python
+@staticmethod
+def _bypass_flow(decision: EntryDecision) -> EntryDecision:
+    new_layer_results = dict(decision.layer_results)
+    new_layer_results["flow"] = True
+    all_pass = all(new_layer_results.values())
+    new_rejection = decision.rejection_reason
+    if new_rejection and "flow" in new_rejection.lower():
+        new_rejection = None
+    return replace(
+        decision,
+        should_enter=all_pass,
+        layer_results=new_layer_results,
+        rejection_reason=new_rejection,
+    )
+```
+
+ご利益:
+- CORE のテストは config 不要で済む（高速）
+- bypass の有効/無効は config だけで切替
+- 将来 bypass 条件を増やしても CORE 層は不変
+
+#### 11.17.2 EntryFlow の `_dispatch_fill` パターン（PR7.2）
+
+PositionMonitor で fill を分類するロジックは `closed_pnl` で entry / 決済を分離：
+
+```python
+async def _dispatch_fill(self, fill: Fill, open_trades: tuple[Trade, ...]) -> str:
+    if fill.closed_pnl == 0:
+        # entry の可能性
+        for trade in open_trades:
+            if not trade.is_filled and self._fill_matches_entry(trade, fill):
+                await self._on_entry_filled(trade, fill)
+                return "entry"
+        return "ignored"
+    # closed_pnl != 0 → 決済の可能性
+    for trade in open_trades:
+        if trade.is_filled and self._fill_matches_close(trade, fill):
+            await self._on_trade_closed(trade, fill)
+            return "close"
+    return "ignored"
+```
+
+#### 11.17.3 BreakerInput の Phase 0 placeholder（PR7.4）
+
+CircuitBreaker の入力には Phase 0 で取れない指標がある。
+**安全側ゼロで埋める**ことで段階的に埋めていく：
+
+| フィールド | Phase 0 | 後続実装 |
+|---|---|---|
+| `daily_loss_pct` | ✅ Repository から計算 | — |
+| `consecutive_losses` | ✅ Repository から取得 | — |
+| `position_count` | ✅ exchange.get_positions | — |
+| `weekly_loss_pct` | ⏳ ゼロ | Phase 1 で残高履歴から |
+| `symbol_1min_changes_pct` | ⏳ 空 tuple | PR6.5 WS trades で |
+| `btc_5min_change_pct` | ⏳ ゼロ | 同上 |
+| `api_error_rate_5min` | ⏳ ゼロ | エラー追跡器を別途実装 |
+
+Phase 0 中に発火するのは **DAILY_LOSS / CONSECUTIVE_LOSS / POSITION_OVERFLOW** のみ。
+
+#### 11.17.4 Scheduler の `_wait_or_shutdown` で `await asyncio.sleep(0)` 必須（PR7.4）
+
+`cycle_interval_seconds=0` の場合、`_wait_or_shutdown(0)` が即 return すると
+他タスク（shutdown 要求等）が実行できないタイトループになる：
+
+```python
+async def _wait_or_shutdown(self, seconds: float) -> None:
+    await asyncio.sleep(0)  # ← 必須・他タスクへの yield 機会
+    if seconds <= 0:
+        return
+    end = asyncio.get_event_loop().time() + seconds
+    while True:
+        if self._shutdown_requested:
+            return
+        remaining = end - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(0.1, remaining))
+```
+
 ---
 
 ## 12. ウォッチリスト戦略
@@ -3884,6 +4229,34 @@ trading:
 
 これは章9.7のサーキットブレーカーとは別レイヤー（個別ポジション保護）。
 
+### 13.7 PR7.2 実装で確定した Funding 強制決済の実装（章 13.4 補強）
+
+`PositionMonitor._force_close` の実装は **reduce_only IOC + slippage tolerance** を採用：
+
+```python
+async def _force_close(self, pos, reason):
+    side = "sell" if pos.size > 0 else "buy"
+    book = await self.exchange.get_l2_book(pos.symbol)
+    tolerance = self.config.force_close_slippage_tolerance_pct
+    if side == "buy":
+        best = book.asks[0].price
+        limit_price = best * (Decimal("1") + tolerance)  # ask 上に余裕
+    else:
+        best = book.bids[0].price
+        limit_price = best * (Decimal("1") - tolerance)  # bid 下に余裕
+
+    request = OrderRequest(
+        symbol=pos.symbol, side=side, size=abs(pos.size),
+        price=limit_price, tif="Ioc", reduce_only=True,
+    )
+```
+
+選択理由:
+- HL に純粋な market 注文はないため limit + IOC で代用
+- `slippage_tolerance` で最悪値を制限
+- `reduce_only=True` で誤って増し玉にならない保証
+- IOC なので残った場合は自動キャンセル
+
 ---
 
 ## 14. 執行戦略：Maker-First
@@ -4089,6 +4462,35 @@ async def _on_entry_filled(trade_id: int):
 
 これにより、章9.3 の状態復元（reconciliation）で trade と order_id が一貫して扱える。
 
+### 14.7 PR7.2 実装で確定した TP/SL order_id 紐付けロジック（章 14.6 詳細化）
+
+実装で確定したのは **「価格近接マッチング」** 方式。`reduce_only` フィールドが
+ADAPTERS 層 `Order` に無いため、**価格が tp_price と sl_price のどちらに近いか**で識別する：
+
+```python
+async def _find_tp_sl_order_ids(self, trade: Trade) -> tuple[int | None, int | None]:
+    open_orders = await self.exchange.get_open_orders()
+    tp_oid: int | None = None
+    sl_oid: int | None = None
+    for order in open_orders:
+        if order.symbol != trade.symbol:
+            continue
+        diff_to_tp = abs(order.price - trade.tp_price)
+        diff_to_sl = abs(order.price - trade.sl_price)
+        if diff_to_tp < diff_to_sl:
+            if tp_oid is None:
+                tp_oid = order.order_id
+        elif sl_oid is None:
+            sl_oid = order.order_id
+    return tp_oid, sl_oid
+```
+
+PR6.4.3 testnet 検証で判明した HL grouped 仕様を反映:
+- `place_orders_grouped` 直後の `results` の中で **entry のみ即 order_id を持つ**
+- TP/SL は entry 約定まで `order_id=None` で保留状態
+- entry が約定すると HL が自動で TP/SL を発注し `open_orders` に出る
+- そこから上記ロジックで紐付ける（PR7.2 position_monitor `_on_entry_filled`）
+
 ---
 
 ## 15. 段階的ロールアウト計画
@@ -4171,6 +4573,26 @@ auto-daytradeで「いきなり実弾→苦戦」した反省を活かし、4段
 ```
 
 **Phase遷移は人間の判断で行う**（自動遷移しない）。設計書の達成基準を満たしたら手動でPhaseアップ。
+
+#### 15.4.1 PR7.5c-fix 確定: Phase 0 SENTIMENT 観察戦略
+
+Phase 0 で `FixedSentimentProvider` を中立値 (`fixed_score=0.0`) のまま使うと、
+SENTIMENT 層が常に弾かれて 4 層 AND が成立せず、**MOMENTUM/REGIME の現実の通過率が
+観察できない**。
+
+`profile_phase0.yaml` で **強制 bullish** (`fixed_score=0.8 / fixed_confidence=0.9`) に
+設定し、SENTIMENT を素通りさせて他 3 層の素の通過率を観察する：
+
+```yaml
+# config/profile_phase0.yaml
+sentiment:
+  fixed_score: 0.8                       # CORE LONG 閾値 0.6 を超える
+  fixed_confidence: 0.9                  # CORE confidence 閾値 0.7 を超える
+  reasoning: "Phase 0 forced bullish for observation"
+```
+
+`is_dry_run=true` のままなので実発注リスクはゼロ。
+PR7.5e で `ClaudeSentimentProvider` に差し替えた後は実 sentiment ベースの観察に移行。
 
 ### 15.5 Phase別の設定差分（章23.9参照）
 
@@ -4333,6 +4755,52 @@ trading:
 
 **この流れで章4〜11すべてが繋がる。**
 新規エントリー判定は全て純関数化されており、APPLICATION層は薄い。
+
+### 19.1 PR7.4 / PR7.5c-fix 実装で確定したログ・組み立て事項
+
+#### 19.1.1 cycle ログのフォーマット（PR7.5c-fix）
+
+旧 `entries=%d` 形式は entry_executed の値だけ表示していて状況把握しづらかった。
+PR7.5c-fix で以下に拡張：
+
+```
+cycle done filled=N closed=N attempts=N executed=N dryrun=N errors=N cb=off|active duration=Xs
+```
+
+各カウンタの意味:
+- `filled` : 当サイクルで entry 約定検知した数
+- `closed` : 当サイクルで TP/SL 約定検知した数
+- `attempts` : evaluate_and_enter を呼んだ回数（watchlist × directions）
+- `executed` : 実際に grouped 発注した回数（dry_run 時はゼロ）
+- `dryrun` : dry_run で 4 層通過した数（観察モードで signals テーブルに記録）
+- `errors` : entry_flow が例外を出した回数
+- `cb` : サーキットブレーカー状態（active なら entry スキップ済み）
+
+#### 19.1.2 Scheduler の `_wait_or_shutdown` ハング対策（PR7.4）
+
+`cycle_interval_seconds=0` でタイトループにならないよう、関数冒頭で
+`await asyncio.sleep(0)` を必ず実行する（章 11.17.4 詳述）。
+これが無いとテストの `request_shutdown` が走れずスケジューラが停止しない。
+
+#### 19.1.3 main.py の依存組み立てと SIGTERM/SIGINT（PR7.5c）
+
+```python
+# src/main.py の async_main 起動シーケンス
+1. load_settings(base, profile)        # YAML → AppSettings (pydantic)
+2. setup_logging(settings)             # TimedRotatingFileHandler + stdout
+3. load_secrets()                      # sops 復号
+4. build_scheduler(settings, secrets)  # 全 INFRASTRUCTURE + APPLICATION 組み立て
+5. await repo.initialize()             # SQLite schema 適用
+6. install_signal_handlers(scheduler)  # SIGINT (+ SIGTERM Linux/Mac)
+7. await scheduler.run()               # メインループ
+8. (finally) await repo.close()
+```
+
+`install_signal_handlers` は SIGINT を必ず登録、SIGTERM は `hasattr(signal, "SIGTERM")`
+で Linux/Mac のみ登録（Windows は SIGTERM 非対応のためスキップ）。
+
+ハンドラの中身は単に `scheduler.request_shutdown()` を呼ぶだけ。
+graceful shutdown は scheduler 側のループで現在のサイクル完了を待つ。
 
 ---
 
@@ -6021,6 +6489,72 @@ if __name__ == "__main__":
 6. ハードコードされた数値を見つけたら設定化する
 ```
 
+### 23.15 PR7.5c 実装で確定した AppSettings 構造
+
+PR7.5c 実装で pydantic v2 + `extra="forbid"` で各セクションを 1:1 で APPLICATION 層
+Config dataclass にマッピングする形で確定（章 11.16 参照）。
+
+#### 23.15.1 AppSettings ルート
+
+```python
+# config/schema.py
+class AppSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    phase: Literal["phase_0", "phase_1", "phase_2", "phase_3", "phase_4"] = "phase_0"
+    exchange:        ExchangeSettings        = Field(default_factory=...)
+    trading:         TradingSettings         = Field(default_factory=...)
+    watchlist:       WatchlistSettings       = Field(default_factory=...)
+    sentiment:       SentimentSettings       = Field(default_factory=...)
+    storage:         StorageSettings         = Field(default_factory=...)
+    scheduler:       SchedulerSettings       = Field(default_factory=...)
+    position_monitor: PositionMonitorSettings = Field(default_factory=...)
+    reconciliation:  ReconciliationSettings  = Field(default_factory=...)
+    entry_flow:      EntryFlowSettings       = Field(default_factory=...)
+    logging:         LoggingSettings         = Field(default_factory=...)
+```
+
+`extra="forbid"` で未知の YAML キーは即エラー（タイポを早期発見）。
+
+#### 23.15.2 settings.yaml と Config dataclass の対応表
+
+| 設定セクション | 対応する dataclass |
+|---|---|
+| `trading` | `EntryFlowConfig`（PR7.1）の dry_run / leverage / flow_layer_enabled / position_size_pct / sl_atr_mult / tp_atr_mult |
+| `entry_flow` | `EntryFlowConfig` の oi_lookup_tolerance_minutes |
+| `position_monitor` | `PositionMonitorConfig`（PR7.2）の 4 フィールド全部 |
+| `reconciliation` | `ReconciliationConfig`（PR7.3）の 2 フィールド |
+| `scheduler` | `SchedulerConfig`（PR7.4）の閾値含む 13 フィールド |
+| `sentiment` | `FixedSentimentProvider`（PR7.5b）の score / confidence / reasoning |
+| `storage` | `SQLiteRepository`（PR7.5a）の db_path |
+| `logging` | `setup_logging`（PR7.5c）の log_file / rotation_when / rotation_backup_count / level |
+
+#### 23.15.3 profile_*.yaml の最小構成（Phase 0 例）
+
+```yaml
+# config/profile_phase0.yaml
+phase: phase_0
+
+trading:
+  is_dry_run: true             # 必ず true（観察モード）
+  position_size_pct: 0.01      # Phase 0 は 1% に絞る
+
+watchlist:
+  directions:
+    - LONG                     # Phase 0 は LONG のみで観察
+
+sentiment:
+  fixed_score: 0.8             # bullish 強制（章 15.4.1 参照）
+  fixed_confidence: 0.9
+  reasoning: "Phase 0 forced bullish for observation"
+```
+
+`load_settings(base, profile)` は `deep_merge` で再帰マージ：
+- dict 同士は再帰マージ
+- 片方が dict でなければ profile が完全上書き
+- profile に書いていないキーは base のまま
+
+---
 
 ## 24. バックテスト基盤
 
@@ -6348,6 +6882,27 @@ class Notifier(Protocol):
 
 実装時はこのProtocolを満たすクラスを`infrastructure/discord_notifier.py`に作る。
 テスト時はモック化して通知内容を検証可能。
+
+### 25.7 PR7.5b 実装で確定した ConsoleNotifier 仕様
+
+Phase 0 観察モード用の最小実装。Discord 実装まで `ConsoleNotifier` で凌ぐ：
+
+```
+[SIGNAL]   logger INFO     ─ エントリー / 決済 / 状態復元
+[ALERT]    logger WARNING  ─ サーキットブレーカー / 障害
+[SUMMARY]  logger INFO     ─ 日次・月次サマリー
+[ERROR]    logger ERROR    ─ 例外（exception 渡しで traceback 付与）
+```
+
+実装上の確定事項：
+- `dedup_key` は受け取って捨てる（Console では実 dedupe しない）
+- `exception` は traceback を末尾に付与
+- 書き込み失敗（stream クローズ等）は `logger.exception` で握りつぶす
+  → メインループを通知障害で落とさない
+- 2 モード切替: `use_logging=True`（本番・logger 経由）/ `False`（テスト・stream 直接）
+
+PR7.5d で DiscordNotifier に差し替え予定。同じ Protocol を満たすので
+`build_scheduler` 側の差し替えは 1 行。
 
 ---
 
