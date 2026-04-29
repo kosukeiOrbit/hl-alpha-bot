@@ -177,6 +177,30 @@ class TestBuildScheduler:
         assert scheduler.config.watchlist == ("SOL", "AVAX")
         assert scheduler.config.directions == ("LONG", "SHORT")
 
+    def test_uses_discord_notifier_when_secrets_configured(self) -> None:
+        # secrets.discord が完備なら DiscordNotifier が選ばれる
+        from src.infrastructure.discord_notifier import DiscordNotifier
+        from src.infrastructure.secrets_loader import (
+            DiscordSecrets,
+            HyperLiquidSecrets,
+        )
+
+        settings = AppSettings()
+        secrets = HyperLiquidSecrets(
+            master_address="0x" + "a" * 40,
+            agent_private_key="0x" + "1" * 64,
+            agent_address="0x" + "b" * 40,
+            network="testnet",
+            discord=DiscordSecrets(
+                webhook_signal="https://discord.com/api/webhooks/sig",
+                webhook_alert="https://discord.com/api/webhooks/alt",
+                webhook_summary="https://discord.com/api/webhooks/sum",
+                webhook_error="https://discord.com/api/webhooks/err",
+            ),
+        )
+        scheduler, _ = build_scheduler(settings, secrets)
+        assert isinstance(scheduler.notifier, DiscordNotifier)
+
 
 # ─── setup_logging ──────────────────────
 

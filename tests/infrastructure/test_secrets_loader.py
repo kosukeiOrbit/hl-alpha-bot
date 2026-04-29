@@ -198,3 +198,79 @@ class TestLoadSecrets:
             mock_run.return_value = MagicMock(stdout=bad_yaml, returncode=0)
             with pytest.raises(SecretsLoadError, match="Schema validation failed"):
                 load_secrets(fake_file)
+
+
+class TestDiscordSection:
+    """PR7.5d で追加した discord セクション対応。"""
+
+    _BASE_YAML = (
+        "hyperliquid:\n"
+        '  master_address: "0x910571363855665c9511f06ed7b691ab32fc1bd5"\n'
+        f'  agent_private_key: "0x{"b" * 64}"\n'
+        '  agent_address: "0xb4a8b7c48114308b03d40de1c958704338a5cd1b"\n'
+        '  network: "testnet"\n'
+    )
+
+    @staticmethod
+    def _run_with_yaml(tmp_path: Path, yaml_text: str) -> object:
+        from src.infrastructure.secrets_loader import load_secrets
+
+        fake_file = tmp_path / "secrets.enc.yaml"
+        fake_file.write_text("ciphertext")
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout=yaml_text, returncode=0
+            )
+            return load_secrets(fake_file)
+
+    def test_no_discord_section_returns_none(self, tmp_path: Path) -> None:
+        secrets = self._run_with_yaml(tmp_path, self._BASE_YAML)
+        assert secrets.discord is None  # type: ignore[attr-defined]
+
+    def test_full_discord_section_is_configured(
+        self, tmp_path: Path
+    ) -> None:
+        yaml_text = self._BASE_YAML + (
+            "discord:\n"
+            '  webhook_signal: "https://discord.com/api/webhooks/sig"\n'
+            '  webhook_alert: "https://discord.com/api/webhooks/alt"\n'
+            '  webhook_summary: "https://discord.com/api/webhooks/sum"\n'
+            '  webhook_error: "https://discord.com/api/webhooks/err"\n'
+        )
+        secrets = self._run_with_yaml(tmp_path, yaml_text)
+        assert secrets.discord is not None  # type: ignore[attr-defined]
+        assert secrets.discord.is_configured is True  # type: ignore[attr-defined]
+        assert (  # type: ignore[attr-defined]
+            secrets.discord.webhook_signal
+            == "https://discord.com/api/webhooks/sig"
+        )
+
+    def test_partial_discord_section_not_configured(
+        self, tmp_path: Path
+    ) -> None:
+        # 3 つだけ設定 → is_configured は False
+        yaml_text = self._BASE_YAML + (
+            "discord:\n"
+            '  webhook_signal: "https://discord.com/api/webhooks/sig"\n'
+            '  webhook_alert: "https://discord.com/api/webhooks/alt"\n'
+            '  webhook_summary: "https://discord.com/api/webhooks/sum"\n'
+        )
+        secrets = self._run_with_yaml(tmp_path, yaml_text)
+        assert secrets.discord is not None  # type: ignore[attr-defined]
+        assert secrets.discord.is_configured is False  # type: ignore[attr-defined]
+        assert secrets.discord.webhook_error is None  # type: ignore[attr-defined]
+
+    def test_discord_secrets_is_frozen(self) -> None:
+        from dataclasses import FrozenInstanceError
+
+        from src.infrastructure.secrets_loader import DiscordSecrets
+
+        d = DiscordSecrets(
+            webhook_signal="a",
+            webhook_alert="b",
+            webhook_summary="c",
+            webhook_error="d",
+        )
+        assert d.is_configured is True
+        with pytest.raises(FrozenInstanceError):
+            d.webhook_signal = "x"  # type: ignore[misc]

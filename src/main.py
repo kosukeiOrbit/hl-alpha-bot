@@ -24,6 +24,7 @@ if str(_PROJECT_ROOT) not in sys.path:  # pragma: no cover
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from config.schema import AppSettings  # noqa: E402
+from src.adapters.notifier import Notifier  # noqa: E402
 from src.application.entry_flow import (  # noqa: E402
     EntryFlow,
     EntryFlowConfig,
@@ -42,6 +43,10 @@ from src.application.scheduler import (  # noqa: E402
 )
 from src.core.config_loader import load_settings  # noqa: E402
 from src.infrastructure.console_notifier import ConsoleNotifier  # noqa: E402
+from src.infrastructure.discord_notifier import (  # noqa: E402
+    DiscordNotifier,
+    DiscordNotifierConfig,
+)
 from src.infrastructure.fixed_sentiment_provider import (  # noqa: E402
     FixedSentimentProvider,
 )
@@ -85,6 +90,26 @@ def setup_logging(settings: AppSettings) -> None:
     root_logger.addHandler(stream_handler)
 
 
+def _build_notifier(secrets: Any) -> Notifier:
+    """secrets.discord が完備なら DiscordNotifier、そうでなければ ConsoleNotifier。
+
+    Discord 設定無しでも起動できるよう後方互換を保つ。
+    """
+    discord = getattr(secrets, "discord", None)
+    if discord is not None and discord.is_configured:
+        logger.info("using DiscordNotifier")
+        return DiscordNotifier(
+            DiscordNotifierConfig(
+                webhook_signal=discord.webhook_signal,
+                webhook_alert=discord.webhook_alert,
+                webhook_summary=discord.webhook_summary,
+                webhook_error=discord.webhook_error,
+            )
+        )
+    logger.info("using ConsoleNotifier (no Discord webhooks configured)")
+    return ConsoleNotifier(use_logging=True)
+
+
 def build_scheduler(
     settings: AppSettings, secrets: Any
 ) -> tuple[Scheduler, SQLiteRepository]:
@@ -99,7 +124,7 @@ def build_scheduler(
         agent_private_key=secrets.agent_private_key,
     )
     repo = SQLiteRepository(settings.storage.db_path)
-    notifier = ConsoleNotifier(use_logging=True)
+    notifier = _build_notifier(secrets)
     sentiment = FixedSentimentProvider(
         score=settings.sentiment.fixed_score,
         confidence=settings.sentiment.fixed_confidence,
@@ -230,6 +255,10 @@ async def async_main(  # pragma: no cover
         await scheduler.run()
     finally:
         await repo.close()
+        # DiscordNotifier 等 close を持つ notifier は閉じる（duck typing）
+        notifier = scheduler.notifier
+        if hasattr(notifier, "close"):
+            await notifier.close()
         logger.info("hl-alpha-bot stopped")
 
 
