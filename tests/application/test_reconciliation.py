@@ -514,6 +514,73 @@ class TestApplyActionDispatch:
         assert any("reconcile_positions" in e for e in summary.errors)
 
 
+# ─── dedup_key（PR7.5d-fix） ─────────
+
+
+class TestDedupKeys:
+    """各通知に dedup_key kwarg が正しく付与されることを確認。"""
+
+    @pytest.mark.asyncio
+    async def test_external_uses_symbol_dedup_key(self) -> None:
+        pos = make_position(symbol="ETH")
+        reconciler, _, _, notifier = build_reconciler(
+            positions=(pos,), open_trades=()
+        )
+        await reconciler.restore_on_startup()
+        ext_call = next(
+            c for c in notifier.send_alert.await_args_list
+            if "external position detected" in c.args[0]
+        )
+        assert ext_call.kwargs["dedup_key"] == "external:ETH"
+
+    @pytest.mark.asyncio
+    async def test_correct_uses_symbol_dedup_key(self) -> None:
+        pos = make_position(size=Decimal("0.001"))
+        trade = make_trade(size_coins=Decimal("0.0002"))
+        reconciler, _, _, notifier = build_reconciler(
+            positions=(pos,), open_trades=(trade,)
+        )
+        await reconciler.restore_on_startup()
+        correct_call = next(
+            c for c in notifier.send_alert.await_args_list
+            if "position mismatch" in c.args[0]
+        )
+        assert correct_call.kwargs["dedup_key"] == "correct:BTC"
+
+    @pytest.mark.asyncio
+    async def test_close_from_fill_uses_trade_id_dedup_key(self) -> None:
+        trade = make_trade()
+        fill = make_fill(
+            symbol="BTC",
+            side="sell",
+            size=trade.size_coins,
+            price=Decimal("66000"),
+            closed_pnl=Decimal("0.2"),
+        )
+        reconciler, _, _, notifier = build_reconciler(
+            positions=(), open_trades=(trade,), fills=(fill,)
+        )
+        await reconciler.restore_on_startup()
+        close_call = next(
+            c for c in notifier.send_signal.await_args_list
+            if "closed from fill" in c.args[0]
+        )
+        assert close_call.kwargs["dedup_key"] == f"close_from_fill:{trade.id}"
+
+    @pytest.mark.asyncio
+    async def test_manual_review_uses_trade_id_dedup_key(self) -> None:
+        trade = make_trade()
+        reconciler, _, _, notifier = build_reconciler(
+            positions=(), open_trades=(trade,), fills=()
+        )
+        await reconciler.restore_on_startup()
+        manual_call = next(
+            c for c in notifier.send_alert.await_args_list
+            if "manual review needed" in c.args[0]
+        )
+        assert manual_call.kwargs["dedup_key"] == f"manual:{trade.id}"
+
+
 # ─── 設定オブジェクト ────────────────
 
 

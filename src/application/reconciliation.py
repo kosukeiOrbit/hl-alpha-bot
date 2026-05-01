@@ -251,7 +251,8 @@ class StateReconciler:
         )
         await self.notifier.send_alert(
             f"external position detected: {hl_pos.symbol} "
-            f"size={hl_pos.size} entry={hl_pos.entry_price}"
+            f"size={hl_pos.size} entry={hl_pos.entry_price}",
+            dedup_key=f"external:{hl_pos.symbol}",
         )
 
     async def _resume_monitoring(self, db_trade: DBTrade) -> None:
@@ -269,7 +270,8 @@ class StateReconciler:
         )
         await self.notifier.send_alert(
             f"position mismatch corrected: {hl_pos.symbol} "
-            f"db_size={db_trade.size} hl_size={hl_pos.size}"
+            f"db_size={db_trade.size} hl_size={hl_pos.size}",
+            dedup_key=f"correct:{hl_pos.symbol}",
         )
 
     async def _close_from_fill(
@@ -295,14 +297,16 @@ class StateReconciler:
         )
         await self.notifier.send_signal(
             f"closed from fill: {db_trade.symbol} @ {adapter_fill.price} "
-            f"pnl={adapter_fill.closed_pnl}"
+            f"pnl={adapter_fill.closed_pnl}",
+            dedup_key=f"close_from_fill:{db_trade.trade_id}",
         )
 
     async def _mark_manual_review(self, db_trade: DBTrade) -> None:
         await self.repo.mark_manual_review(db_trade.trade_id)
         await self.notifier.send_alert(
             f"manual review needed: trade_id={db_trade.trade_id} "
-            f"({db_trade.symbol})"
+            f"({db_trade.symbol})",
+            dedup_key=f"manual:{db_trade.trade_id}",
         )
 
     # ─── stale order cleanup ──────────────────

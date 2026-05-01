@@ -730,6 +730,81 @@ class TestErrorHandling:
         assert any("detect_fills" in e for e in result.errors)
 
 
+# ─── dedup_key（PR7.5d-fix） ─────────────
+
+
+class TestDedupKeys:
+    """各通知に dedup_key kwarg が正しく付与されることを確認。"""
+
+    @pytest.mark.asyncio
+    async def test_fill_uses_trade_id_dedup_key(self) -> None:
+        trade = make_trade()
+        monitor, _, _, notifier = build_monitor(
+            fills=(make_fill(),),
+            open_trades=(trade,),
+        )
+        await monitor.run_cycle()
+        # FILL の send_signal が dedup_key=fill:{trade.id}
+        fill_call = next(
+            c for c in notifier.send_signal.await_args_list
+            if "FILL" in c.args[0]
+        )
+        assert fill_call.kwargs["dedup_key"] == f"fill:{trade.id}"
+
+    @pytest.mark.asyncio
+    async def test_close_uses_trade_id_dedup_key(self) -> None:
+        # 既に約定済み LONG trade に対して反対 side(sell) + closed_pnl != 0
+        # の fill が来たら _on_trade_closed が走る
+        trade = make_trade(is_filled=True, tp_price=Decimal("65500"))
+        close_fill = make_fill(
+            side="sell",
+            price=Decimal("65500"),
+            closed_pnl=Decimal("50"),
+        )
+        monitor, _, _, notifier = build_monitor(
+            fills=(close_fill,),
+            open_trades=(trade,),
+        )
+        await monitor.run_cycle()
+        close_call = next(
+            c for c in notifier.send_signal.await_args_list
+            if c.args[0].startswith("CLOSE ")
+        )
+        assert close_call.kwargs["dedup_key"] == f"close:{trade.id}"
+
+    @pytest.mark.asyncio
+    async def test_force_close_uses_symbol_reason_dedup_key(self) -> None:
+        fixed_now = datetime(2026, 4, 28, 13, 57, 0, tzinfo=UTC)
+        position = make_position()
+        monitor, _, _, notifier = build_monitor(positions=(position,))
+        with patch(_TARGET) as mock_dt:
+            mock_dt.now.return_value = fixed_now
+            mock_dt.fromtimestamp = datetime.fromtimestamp
+            await monitor.run_cycle()
+        signal_call = next(
+            c for c in notifier.send_signal.await_args_list
+            if "FORCE_CLOSE" in c.args[0]
+        )
+        assert signal_call.kwargs["dedup_key"] == (
+            f"force_close:{position.symbol}:FUNDING"
+        )
+
+    @pytest.mark.asyncio
+    async def test_force_close_failure_uses_symbol_dedup_key(self) -> None:
+        fixed_now = datetime(2026, 4, 28, 13, 57, 0, tzinfo=UTC)
+        pos = make_position()
+        monitor, exchange, _, notifier = build_monitor(positions=(pos,))
+        exchange.place_order = AsyncMock(side_effect=ExchangeError("boom"))
+        with patch(_TARGET) as mock_dt:
+            mock_dt.now.return_value = fixed_now
+            mock_dt.fromtimestamp = datetime.fromtimestamp
+            await monitor.run_cycle()
+        notifier.send_alert.assert_awaited_once()
+        assert notifier.send_alert.call_args.kwargs["dedup_key"] == (
+            f"force_close_fail:{pos.symbol}"
+        )
+
+
 # ─── 結果オブジェクト ────────────────────
 
 

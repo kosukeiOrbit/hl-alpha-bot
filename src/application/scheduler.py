@@ -148,6 +148,7 @@ class Scheduler:
                 await self._safe_notify(
                     "send_alert",
                     "unexpected exception in cycle (continuing next cycle)",
+                    dedup_key="cycle_error",
                 )
 
             elapsed = (datetime.now(UTC) - cycle_start).total_seconds()
@@ -328,11 +329,13 @@ class Scheduler:
             await self._safe_notify(
                 "send_alert",
                 f"circuit breaker activated: {reason}",
+                dedup_key=f"cb_active:{reason}",
             )
         else:
             await self._safe_notify(
                 "send_signal",
                 "circuit breaker cleared",
+                dedup_key="cb_clear",
             )
         self._last_breaker_active = result.triggered
 
@@ -369,11 +372,30 @@ class Scheduler:
             await self._safe_notify(
                 "send_alert",
                 f"{step_name} failed (continuing)",
+                dedup_key=f"step_fail:{step_name}",
             )
 
-    async def _safe_notify(self, method_name: str, message: str) -> None:
+    async def _safe_notify(
+        self,
+        method_name: str,
+        message: str,
+        *,
+        dedup_key: str | None = None,
+        exception: Exception | None = None,
+    ) -> None:
+        """通知失敗で全体を落とさない。
+
+        method_name に応じて受け付ける kwarg だけを通すよう振り分ける
+        （Notifier Protocol で send_summary は dedup_key を持たず、
+        send_error だけが exception を持つため）。
+        """
         try:
             method = getattr(self.notifier, method_name)
-            await method(message)
+            kwargs: dict[str, object] = {}
+            if method_name in ("send_signal", "send_alert"):
+                kwargs["dedup_key"] = dedup_key
+            elif method_name == "send_error":
+                kwargs["exception"] = exception
+            await method(message, **kwargs)
         except Exception:
             logger.exception("notification failed: %s", method_name)

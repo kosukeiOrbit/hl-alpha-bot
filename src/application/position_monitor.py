@@ -185,7 +185,8 @@ class PositionMonitor:
         )
         await self.notifier.send_signal(
             f"FILL {trade.direction} {trade.symbol} @ {fill.price} "
-            f"(trade_id={trade.id}, tp_oid={tp_oid}, sl_oid={sl_oid})"
+            f"(trade_id={trade.id}, tp_oid={tp_oid}, sl_oid={sl_oid})",
+            dedup_key=f"fill:{trade.id}",
         )
 
     async def _find_tp_sl_order_ids(
@@ -235,7 +236,8 @@ class PositionMonitor:
         sign = "+" if fill.closed_pnl >= 0 else ""
         await self.notifier.send_signal(
             f"CLOSE {trade.direction} {trade.symbol} by {exit_reason} @ "
-            f"{fill.price} PnL={sign}{fill.closed_pnl} (trade_id={trade.id})"
+            f"{fill.price} PnL={sign}{fill.closed_pnl} (trade_id={trade.id})",
+            dedup_key=f"close:{trade.id}",
         )
 
     # ─── MFE/MAE 更新 ──────────────────────────
@@ -310,7 +312,8 @@ class PositionMonitor:
             except ExchangeError as e:
                 logger.exception("force close failed: %s", pos.symbol)
                 await self.notifier.send_alert(
-                    f"force close failed for {pos.symbol}: {e}"
+                    f"force close failed for {pos.symbol}: {e}",
+                    dedup_key=f"force_close_fail:{pos.symbol}",
                 )
         return forced
 
@@ -344,7 +347,8 @@ class PositionMonitor:
         if result.success:
             await self.notifier.send_signal(
                 f"FORCE_CLOSE {pos.symbol} reason={reason} size={size} "
-                f"(order_id={result.order_id})"
+                f"(order_id={result.order_id})",
+                dedup_key=f"force_close:{pos.symbol}:{reason}",
             )
 
     # ─── ヘルパー ──────────────────────────────

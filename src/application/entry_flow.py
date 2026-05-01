@@ -122,7 +122,8 @@ class EntryFlow:
         if self.config.is_dry_run:
             await self.notifier.send_signal(
                 f"[DRYRUN] {direction} {symbol} would enter at "
-                f"{snapshot.current_price}"
+                f"{snapshot.current_price}",
+                dedup_key=f"dryrun:{symbol}:{direction}",
             )
             return EntryAttempt(
                 symbol=symbol,
@@ -372,7 +373,8 @@ class EntryFlow:
         ) as e:
             logger.exception("place_orders_grouped failed")
             await self.notifier.send_alert(
-                f"entry failed for {snapshot.symbol} {direction}: {e}"
+                f"entry failed for {snapshot.symbol} {direction}: {e}",
+                dedup_key=f"entry_fail:{snapshot.symbol}:{direction}",
             )
             return EntryAttempt(
                 symbol=snapshot.symbol,
@@ -422,7 +424,8 @@ class EntryFlow:
         await self.notifier.send_signal(
             f"{direction} {snapshot.symbol} @{entry_price} "
             f"size={sizing.size_coins} sl={sl_tp.sl_price} "
-            f"tp={sl_tp.tp_price} (trade_id={trade_id})"
+            f"tp={sl_tp.tp_price} (trade_id={trade_id})",
+            dedup_key=f"entry:{trade_id}",
         )
         return EntryAttempt(
             symbol=snapshot.symbol,

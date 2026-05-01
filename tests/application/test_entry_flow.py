@@ -475,6 +475,47 @@ class TestEntryAttemptShape:
             attempt.executed = True  # type: ignore[misc]
 
 
+# ─── dedup_key（PR7.5d-fix） ─────────────────────
+
+
+class TestDedupKeys:
+    """各通知に dedup_key kwarg が正しく付与されることを確認。"""
+
+    @pytest.mark.asyncio
+    async def test_dryrun_uses_symbol_direction_dedup_key(self) -> None:
+        flow, _, _, _, notifier = build_flow(
+            config=make_config(is_dry_run=True),
+        )
+        await flow.evaluate_and_enter("ETH", "LONG")
+        notifier.send_signal.assert_awaited_once()
+        assert notifier.send_signal.call_args.kwargs["dedup_key"] == (
+            "dryrun:ETH:LONG"
+        )
+
+    @pytest.mark.asyncio
+    async def test_real_entry_uses_trade_id_dedup_key(self) -> None:
+        flow, _, _, _, notifier = build_flow()
+        attempt = await flow.evaluate_and_enter("ETH", "LONG")
+        assert attempt.executed is True
+        notifier.send_signal.assert_awaited_once()
+        assert notifier.send_signal.call_args.kwargs["dedup_key"] == (
+            f"entry:{attempt.trade_id}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_entry_failure_uses_symbol_direction_dedup_key(self) -> None:
+        flow, _, _, _, notifier = build_flow(
+            grouped_side_effect=OrderRejectedError(
+                "ALO rejected", code="ALO_REJECT"
+            )
+        )
+        await flow.evaluate_and_enter("ETH", "LONG")
+        notifier.send_alert.assert_awaited_once()
+        assert notifier.send_alert.call_args.kwargs["dedup_key"] == (
+            "entry_fail:ETH:LONG"
+        )
+
+
 # ─── direction Literal 型 ─────────────────────────
 
 

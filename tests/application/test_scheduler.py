@@ -529,6 +529,77 @@ class TestNotificationFailure:
         await scheduler._safe_notify("send_signal", "test message")
 
 
+# ─── dedup_key（PR7.5d-fix） ─────────
+
+
+class TestDedupKeys:
+    """ブレーカー / cycle_error に dedup_key を付与しているか。"""
+
+    @pytest.mark.asyncio
+    async def test_breaker_active_uses_reason_dedup_key(self) -> None:
+        scheduler, _, _, notifier, _, _, _ = build_scheduler(
+            config=make_config(
+                circuit_breaker_enabled=True, consecutive_loss_limit=3
+            ),
+            consecutive_losses=4,
+        )
+        await scheduler.run_cycle_once()
+        notifier.send_alert.assert_awaited_once()
+        assert notifier.send_alert.call_args.kwargs["dedup_key"] == (
+            "cb_active:CONSECUTIVE_LOSS"
+        )
+
+    @pytest.mark.asyncio
+    async def test_breaker_clear_uses_constant_dedup_key(self) -> None:
+        scheduler, _, _, notifier, _, _, _ = build_scheduler(
+            config=make_config(
+                circuit_breaker_enabled=True, consecutive_loss_limit=3
+            ),
+            consecutive_losses=4,
+        )
+        await scheduler.run_cycle_once()
+        notifier.send_signal.reset_mock()
+        scheduler.repo.get_consecutive_losses = AsyncMock(return_value=0)
+        await scheduler.run_cycle_once()
+        # cb_clear で発火
+        clear_call = next(
+            c for c in notifier.send_signal.await_args_list
+            if "cleared" in c.args[0].lower()
+        )
+        assert clear_call.kwargs["dedup_key"] == "cb_clear"
+
+    @pytest.mark.asyncio
+    async def test_safe_notify_passes_dedup_key_to_notifier(self) -> None:
+        scheduler, _, _, notifier, _, _, _ = build_scheduler()
+        await scheduler._safe_notify(
+            "send_alert", "msg", dedup_key="my_key"
+        )
+        notifier.send_alert.assert_awaited_once_with(
+            "msg", dedup_key="my_key"
+        )
+
+    @pytest.mark.asyncio
+    async def test_safe_notify_passes_exception_to_send_error(self) -> None:
+        scheduler, _, _, notifier, _, _, _ = build_scheduler()
+        exc = ValueError("boom")
+        await scheduler._safe_notify(
+            "send_error", "msg", exception=exc
+        )
+        notifier.send_error.assert_awaited_once_with(
+            "msg", exception=exc
+        )
+
+    @pytest.mark.asyncio
+    async def test_safe_notify_summary_strips_kwargs(self) -> None:
+        # send_summary は dedup_key/exception を受け取らない。
+        # 渡された kwarg が誤って transferされていないこと。
+        scheduler, _, _, notifier, _, _, _ = build_scheduler()
+        await scheduler._safe_notify(
+            "send_summary", "daily", dedup_key="ignored"
+        )
+        notifier.send_summary.assert_awaited_once_with("daily")
+
+
 # ─── 結果オブジェクト ─────────────────
 
 
