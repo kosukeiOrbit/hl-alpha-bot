@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from src.adapters.exchange import (
+    Candle,
     ExchangeError,
     OrderRejectedError,
     OrderResult,
@@ -143,8 +144,15 @@ def build_flow(
     grouped_results: tuple[OrderResult, ...] | None = None,
     grouped_side_effect: BaseException | None = None,
     oi_at_value: Decimal | None = Decimal("100"),
+    btc_candles: tuple[Any, ...] | None = None,
+    candles_side_effect: BaseException | None = None,
 ) -> tuple[EntryFlow, Any, Any, Any, Any]:
-    """EntryFlow + AsyncMock の組を返す。"""
+    """EntryFlow + AsyncMock の組を返す。
+
+    btc_candles を渡さない場合は空 tuple を返すので、entry_flow は
+    フォールバック（24h 比較）に落ちる。EMA/ATR を実走させたいテスト
+    では明示的に candles を渡す。
+    """
     eth_snap = eth_snapshot or make_passing_long_snapshot()
     btc_snap = btc_snapshot or make_btc_snapshot()
     sentiment_res = sentiment_result or make_sentiment()
@@ -159,6 +167,12 @@ def build_flow(
     exchange.get_account_balance_usd = AsyncMock(return_value=balance)
     exchange.get_sz_decimals = AsyncMock(return_value=sz_decimals)
     exchange.get_tick_size = AsyncMock(return_value=tick_size)
+    if candles_side_effect is not None:
+        exchange.get_candles = AsyncMock(side_effect=candles_side_effect)
+    else:
+        exchange.get_candles = AsyncMock(
+            return_value=btc_candles if btc_candles is not None else ()
+        )
     if grouped_side_effect is not None:
         exchange.place_orders_grouped = AsyncMock(side_effect=grouped_side_effect)
     else:
@@ -219,25 +233,176 @@ class TestBuildSnapshot:
         assert exchange.get_market_snapshot.await_count == 1
 
 
-# ─── BTC レジーム簡易計算 ────────────────────────────
+# ─── BTC レジーム判定: フォールバック（PR7.1 互換） ───
 
 
-class TestBtcRegimeHelpers:
+class TestBtcRegimeFallbacks:
+    """ローソク足が使えない時の簡易判定。PR7.7 で fallback に移動。"""
+
     def test_uptrend_when_above_24h_open(self) -> None:
         btc = make_btc_snapshot(current_price=70000.0, rolling_24h_open=68000.0)
-        assert EntryFlow._calc_btc_ema_trend(btc) == "UPTREND"
+        assert EntryFlow._fallback_btc_ema_trend(btc) == "UPTREND"
 
     def test_downtrend_when_below_24h_open(self) -> None:
         btc = make_btc_snapshot(current_price=66000.0, rolling_24h_open=68000.0)
-        assert EntryFlow._calc_btc_ema_trend(btc) == "DOWNTREND"
+        assert EntryFlow._fallback_btc_ema_trend(btc) == "DOWNTREND"
 
     def test_atr_pct_zero_when_price_zero(self) -> None:
         btc = make_btc_snapshot(current_price=0.0)
-        assert EntryFlow._calc_btc_atr_pct(btc) == 0.0
+        assert EntryFlow._fallback_btc_atr_pct(btc) == 0.0
 
     def test_atr_pct_basic(self) -> None:
         btc = make_btc_snapshot(current_price=70000.0, high_24h=71000.0, low_24h=69000.0)
-        assert EntryFlow._calc_btc_atr_pct(btc) == pytest.approx(
+        assert EntryFlow._fallback_btc_atr_pct(btc) == pytest.approx(
+            (71000.0 - 69000.0) / 70000.0 * 100
+        )
+
+
+# ─── BTC レジーム判定: ローソク足ベース（PR7.7） ──
+
+
+def _make_candle(
+    *,
+    close: float,
+    high: float | None = None,
+    low: float | None = None,
+    timestamp_ms: int = 0,
+) -> Candle:
+    """テスト用 Candle ファクトリ。high/low 未指定時は close ±1% で埋める。"""
+    h = high if high is not None else close * 1.01
+    low_ = low if low is not None else close * 0.99
+    return Candle(
+        symbol="BTC",
+        interval="15m",
+        timestamp_ms=timestamp_ms,
+        open=Decimal(str(close)),
+        high=Decimal(str(h)),
+        low=Decimal(str(low_)),
+        close=Decimal(str(close)),
+        volume=Decimal("1"),
+    )
+
+
+def _uptrend_candles(n: int = 60) -> tuple[Candle, ...]:
+    """単調上昇のローソク足 n 本。EMA20 > EMA50 になる。"""
+    return tuple(
+        _make_candle(close=60000.0 + i * 50, timestamp_ms=i)
+        for i in range(n)
+    )
+
+
+def _downtrend_candles(n: int = 60) -> tuple[Candle, ...]:
+    """単調下降のローソク足 n 本。EMA20 < EMA50 になる。"""
+    return tuple(
+        _make_candle(close=70000.0 - i * 50, timestamp_ms=i)
+        for i in range(n)
+    )
+
+
+def _flat_candles(n: int = 60) -> tuple[Candle, ...]:
+    """完全に flat → EMA20 == EMA50 → NEUTRAL。"""
+    return tuple(
+        _make_candle(close=70000.0, timestamp_ms=i) for i in range(n)
+    )
+
+
+class TestBtcEmaTrend:
+    @pytest.mark.asyncio
+    async def test_uptrend_when_ema_short_above_long(self) -> None:
+        flow, _, _, _, _ = build_flow(btc_candles=_uptrend_candles())
+        btc_snap = make_btc_snapshot()
+        assert await flow._calc_btc_ema_trend(btc_snap) == "UPTREND"
+
+    @pytest.mark.asyncio
+    async def test_downtrend_when_ema_short_below_long(self) -> None:
+        flow, _, _, _, _ = build_flow(btc_candles=_downtrend_candles())
+        btc_snap = make_btc_snapshot()
+        assert await flow._calc_btc_ema_trend(btc_snap) == "DOWNTREND"
+
+    @pytest.mark.asyncio
+    async def test_neutral_branch_via_monkeypatched_indicators(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Decimal の有限精度上、定数価格でも EMA20 と EMA50 は厳密一致しない。
+        # NEUTRAL 分岐は indicators をモンキーパッチして到達確認する。
+        flow, _, _, _, _ = build_flow(btc_candles=_flat_candles())
+        monkeypatch.setattr(
+            "src.application.entry_flow.calculate_ema",
+            lambda prices, period: Decimal("70000"),
+        )
+        btc_snap = make_btc_snapshot()
+        assert await flow._calc_btc_ema_trend(btc_snap) == "NEUTRAL"
+
+    @pytest.mark.asyncio
+    async def test_fallback_on_exchange_error(self) -> None:
+        flow, _, _, _, _ = build_flow(
+            candles_side_effect=ExchangeError("api down"),
+            btc_snapshot=make_btc_snapshot(
+                current_price=70000.0, rolling_24h_open=68000.0
+            ),
+        )
+        btc_snap = make_btc_snapshot(
+            current_price=70000.0, rolling_24h_open=68000.0
+        )
+        assert await flow._calc_btc_ema_trend(btc_snap) == "UPTREND"
+
+    @pytest.mark.asyncio
+    async def test_fallback_when_insufficient_candles(self) -> None:
+        # EMA50 が要求するシード（50 本）に届かない
+        flow, _, _, _, _ = build_flow(btc_candles=_uptrend_candles(n=40))
+        btc_snap = make_btc_snapshot(
+            current_price=70000.0, rolling_24h_open=68000.0
+        )
+        assert await flow._calc_btc_ema_trend(btc_snap) == "UPTREND"
+
+
+class TestBtcAtrPct:
+    @pytest.mark.asyncio
+    async def test_basic_calculation(self) -> None:
+        # 16 本: high-low=20 で固定 → ATR=20、close=100 → 20%
+        candles = tuple(
+            Candle(
+                symbol="BTC",
+                interval="15m",
+                timestamp_ms=i,
+                open=Decimal("100"),
+                high=Decimal("110"),
+                low=Decimal("90"),
+                close=Decimal("100"),
+                volume=Decimal("1"),
+            )
+            for i in range(16)
+        )
+        flow, _, _, _, _ = build_flow(btc_candles=candles)
+        btc_snap = make_btc_snapshot()
+        assert await flow._calc_btc_atr_pct(btc_snap) == pytest.approx(20.0)
+
+    @pytest.mark.asyncio
+    async def test_fallback_on_exchange_error(self) -> None:
+        flow, _, _, _, _ = build_flow(
+            candles_side_effect=ExchangeError("api down"),
+        )
+        btc_snap = make_btc_snapshot(
+            current_price=70000.0, high_24h=71000.0, low_24h=69000.0
+        )
+        result = await flow._calc_btc_atr_pct(btc_snap)
+        assert result == pytest.approx(
+            (71000.0 - 69000.0) / 70000.0 * 100
+        )
+
+    @pytest.mark.asyncio
+    async def test_fallback_when_insufficient_candles(self) -> None:
+        # ATR(14) には 15 本必要。10 本では足りずフォールバック。
+        candles = tuple(
+            _make_candle(close=70000.0, timestamp_ms=i) for i in range(10)
+        )
+        flow, _, _, _, _ = build_flow(btc_candles=candles)
+        btc_snap = make_btc_snapshot(
+            current_price=70000.0, high_24h=71000.0, low_24h=69000.0
+        )
+        result = await flow._calc_btc_atr_pct(btc_snap)
+        # フォールバックは 24h レンジ
+        assert result == pytest.approx(
             (71000.0 - 69000.0) / 70000.0 * 100
         )
 

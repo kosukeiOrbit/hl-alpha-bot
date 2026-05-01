@@ -78,6 +78,20 @@ class Fill:
 
 
 @dataclass(frozen=True)
+class Candle:
+    """ローソク足（章22.7 candleSnapshot）。timestamp_ms は開始時刻。"""
+
+    symbol: str
+    interval: str
+    timestamp_ms: int
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
+
+
+@dataclass(frozen=True)
 class FundingPayment:
     """Funding精算履歴（章22.6）。payment_usd は正=受取 / 負=支払。"""
 
@@ -179,6 +193,10 @@ class ExchangeProtocol(Protocol):
     async def get_funding_rate_8h(self, symbol: str) -> Decimal: ...
 
     async def get_open_interest(self, symbol: str) -> Decimal: ...
+
+    async def get_candles(
+        self, symbol: str, interval: str, limit: int = 100
+    ) -> tuple[Candle, ...]: ...
 
     # ─── ユーザー状態取得 ───
     async def get_positions(self) -> tuple[Position, ...]: ...

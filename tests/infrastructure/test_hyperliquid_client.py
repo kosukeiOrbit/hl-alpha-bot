@@ -412,6 +412,55 @@ class TestFetchRecentCandles:
 
 
 # ────────────────────────────────────────────────
+# get_candles (公開 API: PR7.7)
+# ────────────────────────────────────────────────
+
+
+class TestGetCandles:
+    @pytest.mark.asyncio
+    async def test_returns_typed_candle_tuple(self) -> None:
+        client = HyperLiquidClient(network="testnet")
+        client._info = MagicMock()
+        client._info.candles_snapshot = MagicMock(
+            return_value=[
+                {
+                    "t": 1700000000000,
+                    "o": "65000",
+                    "h": "65200",
+                    "l": "64900",
+                    "c": "65100",
+                    "v": "10",
+                },
+                {
+                    "t": 1700000900000,
+                    "o": "65100",
+                    "h": "65300",
+                    "l": "65000",
+                    "c": "65250",
+                    "v": "12",
+                },
+            ]
+        )
+        candles = await client.get_candles("BTC", "15m", 2)
+        assert len(candles) == 2
+        c0 = candles[0]
+        assert c0.symbol == "BTC"
+        assert c0.interval == "15m"
+        assert c0.timestamp_ms == 1700000000000
+        assert c0.open == Decimal("65000")
+        assert c0.high == Decimal("65200")
+        assert c0.low == Decimal("64900")
+        assert c0.close == Decimal("65100")
+        assert c0.volume == Decimal("10")
+
+    @pytest.mark.asyncio
+    async def test_propagates_unsupported_interval(self) -> None:
+        client = HyperLiquidClient(network="testnet")
+        with pytest.raises(ExchangeError, match="Unsupported interval"):
+            await client.get_candles("BTC", "7m", 5)
+
+
+# ────────────────────────────────────────────────
 # _get_utc_day_open_price
 # ────────────────────────────────────────────────
 

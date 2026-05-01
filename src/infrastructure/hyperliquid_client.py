@@ -32,6 +32,7 @@ from hyperliquid.info import Info  # type: ignore[import-untyped]
 from hyperliquid.utils.types import Cloid  # type: ignore[import-untyped]
 
 from src.adapters.exchange import (
+    Candle,
     DuplicateOrderError,
     ExchangeError,
     Fill,
@@ -393,6 +394,29 @@ class HyperLiquidClient:
         except Exception as e:
             raise ExchangeError(f"Failed to fetch candles for {symbol}: {e}") from e
         return list(response)
+
+    async def get_candles(
+        self, symbol: str, interval: str, limit: int = 100
+    ) -> tuple[Candle, ...]:
+        """直近 limit 本のローソク足を Candle dataclass で返す（古い→新しい順）。
+
+        指標計算（EMA / ATR 等）から使う公開 API。内部的には
+        ``_fetch_recent_candles`` を呼んで dict → Candle に変換する。
+        """
+        raw = await self._fetch_recent_candles(symbol, interval, limit)
+        return tuple(
+            Candle(
+                symbol=symbol,
+                interval=interval,
+                timestamp_ms=int(c["t"]),
+                open=Decimal(str(c["o"])),
+                high=Decimal(str(c["h"])),
+                low=Decimal(str(c["l"])),
+                close=Decimal(str(c["c"])),
+                volume=Decimal(str(c["v"])),
+            )
+            for c in raw
+        )
 
     async def _get_utc_day_open_price(self, symbol: str) -> Decimal:
         """当日 UTC 00:00 の始値を取得（1h 足の最初のローソクの open）。"""

@@ -40,9 +40,18 @@ from src.adapters.notifier import Notifier
 from src.adapters.repository import Repository, SignalLog, TradeOpenRequest
 from src.adapters.sentiment import SentimentProvider
 from src.core.entry_judge import judge_long_entry, judge_short_entry
+from src.core.indicators import calculate_atr_pct, calculate_ema
 from src.core.models import EntryDecision, MarketSnapshot
 from src.core.position_sizer import SizingInput, calculate_position_size
 from src.core.stop_loss import StopLossInput, calculate_sl_tp
+
+# BTC レジーム判定用ローソク足設定（章4 ④ REGIME）
+_BTC_REGIME_INTERVAL = "15m"
+_BTC_EMA_LIMIT = 60  # EMA50 のシード(50) + マージン
+_BTC_EMA_SHORT_PERIOD = 20
+_BTC_EMA_LONG_PERIOD = 50
+_BTC_ATR_LIMIT = 30  # ATR(14) は 15 本以上必要、マージン込み
+_BTC_ATR_PERIOD = 14
 
 logger = logging.getLogger(__name__)
 
@@ -148,12 +157,13 @@ class EntryFlow:
             symbol=symbol, direction=direction
         )
 
-        # BTC レジーム情報は別 snapshot から導出
+        # BTC レジーム情報はローソク足から計算（章4 ④ REGIME）。
+        # 取得失敗時は 24h スナップショットからの簡易判定にフォールバック。
         btc_snap = (
             market if symbol == "BTC" else await self.exchange.get_market_snapshot("BTC")
         )
-        btc_ema_trend = self._calc_btc_ema_trend(btc_snap)
-        btc_atr_pct = self._calc_btc_atr_pct(btc_snap)
+        btc_ema_trend = await self._calc_btc_ema_trend(btc_snap)
+        btc_atr_pct = await self._calc_btc_atr_pct(btc_snap)
 
         # OI 履歴
         oi_now = await self.exchange.get_open_interest(symbol)
@@ -176,16 +186,81 @@ class EntryFlow:
             open_interest_1h_ago=float(oi_1h_ago_value),
         )
 
+    async def _calc_btc_ema_trend(self, btc_snap: MarketSnapshot) -> str:
+        """BTC 15m EMA20 vs EMA50 でトレンド判定（章4 ④ REGIME）。
+
+        Returns:
+            "UPTREND" / "DOWNTREND" / "NEUTRAL"
+            ローソク足取得失敗・本数不足時は 24h 比較にフォールバック。
+        """
+        try:
+            candles = await self.exchange.get_candles(
+                symbol="BTC",
+                interval=_BTC_REGIME_INTERVAL,
+                limit=_BTC_EMA_LIMIT,
+            )
+        except ExchangeError as e:
+            logger.warning(
+                "BTC candles fetch failed for EMA: %s, falling back", e
+            )
+            return self._fallback_btc_ema_trend(btc_snap)
+
+        if len(candles) < _BTC_EMA_LONG_PERIOD:
+            logger.warning(
+                "Not enough BTC candles for EMA50: got %d", len(candles)
+            )
+            return self._fallback_btc_ema_trend(btc_snap)
+
+        closes = [c.close for c in candles]
+        ema_short = calculate_ema(closes, period=_BTC_EMA_SHORT_PERIOD)
+        ema_long = calculate_ema(closes, period=_BTC_EMA_LONG_PERIOD)
+        if ema_short > ema_long:
+            return "UPTREND"
+        if ema_short < ema_long:
+            return "DOWNTREND"
+        return "NEUTRAL"
+
+    async def _calc_btc_atr_pct(self, btc_snap: MarketSnapshot) -> float:
+        """BTC 15m ATR(14) を最新 close で割った %（章4 ④ REGIME）。
+
+        ローソク足取得失敗・本数不足時は 24h レンジ幅で代用。
+        """
+        try:
+            candles = await self.exchange.get_candles(
+                symbol="BTC",
+                interval=_BTC_REGIME_INTERVAL,
+                limit=_BTC_ATR_LIMIT,
+            )
+        except ExchangeError as e:
+            logger.warning(
+                "BTC candles fetch failed for ATR: %s, falling back", e
+            )
+            return self._fallback_btc_atr_pct(btc_snap)
+
+        if len(candles) < _BTC_ATR_PERIOD + 1:
+            logger.warning(
+                "Not enough BTC candles for ATR(%d): got %d",
+                _BTC_ATR_PERIOD,
+                len(candles),
+            )
+            return self._fallback_btc_atr_pct(btc_snap)
+
+        highs = [c.high for c in candles]
+        lows = [c.low for c in candles]
+        closes = [c.close for c in candles]
+        atr_pct = calculate_atr_pct(highs, lows, closes, period=_BTC_ATR_PERIOD)
+        return float(atr_pct)
+
     @staticmethod
-    def _calc_btc_ema_trend(btc_snap: MarketSnapshot) -> str:
-        """簡易: 24h前比で UPTREND / DOWNTREND を判定（章11.6 簡易実装・後続で精緻化）。"""
+    def _fallback_btc_ema_trend(btc_snap: MarketSnapshot) -> str:
+        """ローソク足が使えない時の簡易判定（PR7.1 互換）。"""
         if btc_snap.current_price > btc_snap.rolling_24h_open:
             return "UPTREND"
         return "DOWNTREND"
 
     @staticmethod
-    def _calc_btc_atr_pct(btc_snap: MarketSnapshot) -> float:
-        """簡易: 24h レンジ幅 / current_price を ATR% の代わりに使う（後続で精緻化）。"""
+    def _fallback_btc_atr_pct(btc_snap: MarketSnapshot) -> float:
+        """ローソク足が使えない時の簡易計算（PR7.1 互換）。"""
         if btc_snap.current_price == 0:
             return 0.0
         return (btc_snap.high_24h - btc_snap.low_24h) / btc_snap.current_price * 100
