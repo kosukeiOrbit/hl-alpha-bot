@@ -3893,6 +3893,103 @@ async def _wait_or_shutdown(self, seconds: float) -> None:
         await asyncio.sleep(min(0.1, remaining))
 ```
 
+#### 11.17.5 BTC レジーム判定の本実装とフォールバック（PR7.7）
+
+Phase 0 観察 48 時間で REGIME 通過率 47.5% と判明し、PR7.1 簡易実装
+（`current_price > rolling_24h_open`）が値動きで頻繁に false に振れるためと
+分かった。15 分足ローソク足ベースの本実装に置き換え：
+
+```python
+# src/application/entry_flow.py 抜粋
+_BTC_REGIME_INTERVAL = "15m"
+_BTC_EMA_LIMIT = 60          # EMA50 のシード(50) + マージン
+_BTC_EMA_SHORT_PERIOD = 20
+_BTC_EMA_LONG_PERIOD = 50
+_BTC_ATR_LIMIT = 30          # ATR(14) は 15 本以上必要、マージン込み
+_BTC_ATR_PERIOD = 14
+
+async def _calc_btc_ema_trend(self, btc_snap: MarketSnapshot) -> str:
+    try:
+        candles = await self.exchange.get_candles(
+            symbol="BTC", interval=_BTC_REGIME_INTERVAL, limit=_BTC_EMA_LIMIT,
+        )
+    except ExchangeError:
+        return self._fallback_btc_ema_trend(btc_snap)
+    if len(candles) < _BTC_EMA_LONG_PERIOD:
+        return self._fallback_btc_ema_trend(btc_snap)
+
+    closes = [c.close for c in candles]
+    ema_short = calculate_ema(closes, period=_BTC_EMA_SHORT_PERIOD)
+    ema_long  = calculate_ema(closes, period=_BTC_EMA_LONG_PERIOD)
+    if ema_short > ema_long:
+        return "UPTREND"
+    if ema_short < ema_long:
+        return "DOWNTREND"
+    return "NEUTRAL"
+```
+
+`_calc_btc_atr_pct` も同様に 30 本ローソク足から `calculate_atr_pct` を呼ぶ。
+
+確定した実装方針:
+- **取得本数**: EMA 用 60 本（EMA50 のシード + 余裕）、ATR 用 30 本（ATR(14) + 余裕）
+- **インターバル**: 15 分足固定（章 4 ④ REGIME の判定軸）
+- **NEUTRAL 分岐**: `Decimal` の有限精度のため定数 close でも厳密一致しない
+  → 実走では事実上 UPTREND/DOWNTREND の二択になる。テストは `monkeypatch`
+   で `calculate_ema` を固定し NEUTRAL 分岐到達のみ検証する。
+- **戻り値型**: `_calc_btc_atr_pct` は内部 `Decimal` で計算後 `float` に cast
+  （`MarketSnapshot.btc_atr_pct: float` を維持。Decimal 化は別 PR）。
+- **フォールバック**: ローソク足取得失敗・本数不足時は `_fallback_btc_ema_trend`
+  / `_fallback_btc_atr_pct` で 24h 比較（PR7.1 ロジック）に戻る。
+  API 一時障害で BOT が止まらないよう必ず保つ。
+
+72 時間観察で REGIME 通過率 78.1% に改善（章15.4.2 で詳述）。
+
+### 11.18 PR7.7 実装で確定した CORE indicators モジュール
+
+CORE 層に純関数のテクニカル指標モジュール `src/core/indicators.py` を新設。
+ローソク足の取得は呼び出し側（INFRASTRUCTURE / APPLICATION）の責務、
+本モジュールは数値計算のみ：
+
+```python
+# src/core/indicators.py（抜粋）
+from decimal import Decimal
+
+
+def calculate_ema(prices: list[Decimal], period: int) -> Decimal:
+    """指数移動平均（EMA）。
+
+    seed = 最初の period 件の SMA、以降は alpha=2/(period+1) で平滑化:
+        EMA(t) = price(t) * alpha + EMA(t-1) * (1 - alpha)
+    """
+
+def calculate_atr(
+    highs: list[Decimal], lows: list[Decimal], closes: list[Decimal],
+    period: int = 14,
+) -> Decimal:
+    """Average True Range。Wilder's smoothing 採用:
+        TR = max(h-l, |h-pc|, |l-pc|)
+        ATR(t) = (ATR(t-1) * (period-1) + TR(t)) / period
+    最初の TR には前足の close が必要なので period+1 本以上必要。
+    """
+
+def calculate_atr_pct(
+    highs: list[Decimal], lows: list[Decimal], closes: list[Decimal],
+    period: int = 14,
+) -> Decimal:
+    """ATR / latest_close * 100。latest_close=0 の場合は 0 を返す。"""
+```
+
+設計判断:
+- **すべて純関数**: 副作用なし、ローソク足取得は呼び出し側
+- **Decimal 統一**: 浮動小数点誤差回避のため `alpha = Decimal(2) / (Decimal(period) + Decimal(1))`
+- **EMA seed**: 最初の period 件の SMA（最も標準的）
+- **ATR smoothing**: Wilder's smoothing（オリジナル定義）。EMA 平滑化版は採用しない
+- **入力検証**: `period < 1`、長さ不一致、本数不足は ValueError を上げる
+  → APPLICATION 層側で `try ... except (ExchangeError, ValueError)` で
+   フォールバックに落とす
+
+将来の `dynamic_stop`（ATR ベース SL/TP）でも同じ純関数を再利用できる。
+
 ---
 
 ## 12. ウォッチリスト戦略
@@ -4594,6 +4691,93 @@ sentiment:
 `is_dry_run=true` のままなので実発注リスクはゼロ。
 PR7.5e で `ClaudeSentimentProvider` に差し替えた後は実 sentiment ベースの観察に移行。
 
+#### 15.4.2 PR7.7 効果検証: 72 時間観察ベースライン（2026-05-02 〜 05）
+
+PR7.7（BTC EMA/ATR 本実装）デプロイ後、72 時間連続観察で REGIME 通過率が
+劇的に改善。`scripts/analyze_phase0.py --window 72h --json` で計測した
+ベースライン値（`logs/pr7_6_5_baseline.json` に保存済み）：
+
+```
+観察期間:
+  earliest_signal: 2026-05-02T13:53:27+00:00
+  latest_signal:   2026-05-05T13:53:11+00:00
+  estimated_cycles: 51,763 (= MOMENTUM 層シグナル総数)
+
+層別通過率:
+  MOMENTUM   1,023 /  51,763  ( 1.98%)
+  FLOW      51,763 /  51,763  (100.00%)
+  SENTIMENT 51,763 /  51,763  (100.00%) ← profile_phase0 forced bullish
+  REGIME    40,420 /  51,763  (78.09%)  ← PR7.7 効果
+
+PR7.1 簡易実装期間（48h・参考値）:
+  REGIME 47.5%  /  MOMENTUM 1.9% (589 件)
+PR7.7 本実装期間（72h・実測）:
+  REGIME 78.1%  /  MOMENTUM 2.0% (1,023 件)
+
+差分:
+  - REGIME +30.6pt（簡易実装の値動きノイズ除去）
+  - MOMENTUM 通過の絶対数 +73%（589 → 1,023、観察時間も +50% なので
+    時間あたりも改善）
+```
+
+判定軸の置き換え:
+- 簡易実装: `current_price > rolling_24h_open`（24h 前比）
+  → 値動きで頻繁に false に振れる
+- 本実装: `EMA20 > EMA50` on 15 分足 60 本
+  → トレンドベースで安定
+
+#### 15.4.3 PR7.7 期間で観察された 4 層通過クラスター
+
+DRYRUN シグナルが短時間に集中する「クラスター」を観察。dedup_key
+（章 25.8.3）が無いと Discord 通知が滞留する根拠データ：
+
+```
+[2026-05-05 01:20:52 〜 01:24:52] BTC LONG  21 件 / 4 分（最大）
+[2026-05-05 02:04:44 〜 02:08:34] ETH+BTC LONG 17 件 / 4 分
+[2026-05-05 10:28:31 〜 10:44:22] ETH LONG  7 件 / 16 分
+
+観察特徴:
+- モメンタム発生時は数分〜十数分続く
+- 1 サイクル(10 秒)ごとに記録されるので秒〜分単位で連発
+- dedup_key=dryrun:{symbol}:{direction} で 5 分窓に圧縮
+  → 21 件のクラスターでも Discord 通知は最初の 1 件のみ
+- DB（signals テーブル）には全件残るので後から analyze_phase0 で集計可能
+```
+
+dedup window（既定 300 秒）の選定根拠は本データ。短いと連発が漏れ、
+長いと「次クラスター開始」が見逃される。5 分は経験則として妥当。
+
+#### 15.4.4 PR7.7 期間で観察された 24 時間サイクル数の安定性
+
+`by_hour` ヒストグラムで、各時刻のシグナル評価数（= サイクル数 × 銘柄数）が
+ほぼフラットになっていることを確認：
+
+```
+[実測値・PR7.7 期間 72h]
+  00:00台: 8616
+  01:00台: 8632
+  04:00台: 8640 (最大)
+  10:00台: 8572 (最小)
+  20:00台: 8580
+  ...
+  範囲: 8572 〜 8640（最大 0.79% の差）
+
+理論値: 24h × 60min × 6 cycles/min = 8640 cycles/symbol
+       = 8640 × 2 銘柄 / 2 (BTC は両方の slot で記録) = 8640
+       ※実装は watchlist=("BTC","ETH")で 2 銘柄評価のため、
+         サイクル数と signals 数は分母設定により近似
+```
+
+含意:
+- BOT は 24h 連続稼働で API レート制限に当たらない
+- サイクル時間が安定（10 秒インターバル + 軽い揺らぎ）
+- 起動初期の偏り（PR7.1 期間 48h で 06:00台 6860 vs 07:00台 3848 などの
+  起動・停止跡）は 3 日連続稼働で平準化される
+- 長期観察に耐えうることを実測で確認
+
+PR7.5e（ClaudeSentimentProvider）デプロイ後も同じ計測スクリプトで
+回帰確認を行う運用とする。
+
 ### 15.5 Phase別の設定差分（章23.9参照）
 
 ```yaml
@@ -4801,6 +4985,36 @@ cycle done filled=N closed=N attempts=N executed=N dryrun=N errors=N cb=off|acti
 
 ハンドラの中身は単に `scheduler.request_shutdown()` を呼ぶだけ。
 graceful shutdown は scheduler 側のループで現在のサイクル完了を待つ。
+
+### 19.2 PR7.7 で増えた API コール数（1 サイクルあたり）
+
+PR7.7 で BTC レジーム判定がローソク足ベースになり、1 サイクル
+（10 秒間隔）あたりの REST API コール数が 7 → 9 に増加：
+
+```
+[PR7.6 時点 = 7 calls/cycle]
+- get_market_snapshot("BTC")    # current_price + rolling_24h_open 等
+- get_market_snapshot("ETH")
+- get_open_interest("BTC")      # OI 履歴
+- get_open_interest("ETH")
+- get_fills(...)                # PositionMonitor の fill 検知
+- get_positions()               # 突合 + ブレーカー入力
+- get_open_orders()             # 突合
+
+[PR7.7 以降 = 9 calls/cycle]
+- 上記 7 calls
+- get_candles("BTC", "15m", 60) # ★追加: EMA 用
+- get_candles("BTC", "15m", 30) # ★追加: ATR 用
+```
+
+レート制限への影響:
+- HL の REST レート制限は IP ベース 1200 req/min（章 22.2）
+- 9 calls × 6 cycles/min = **54 req/min**（4.5% 消費）→ 余裕
+
+将来最適化候補:
+- 同じ cycle 内で BTC ローソク足を 2 回取らない（60 本取って 30 本分を再利用）
+- 結果キャッシュ（次サイクル冒頭の interval 境界判定）
+- 観察データから問題化したら別 PR で対応。Phase 0 の 9 calls/cycle で問題は出ていない。
 
 ---
 
@@ -5371,6 +5585,62 @@ HYPEトークンステーキングで5%〜40%割引（>10 HYPE で5%、>500K HYP
 
 **サポートする candle interval：**
 `1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 8h, 12h, 1d, 3d, 1w, 1M`
+
+#### candleSnapshot を使う公開 API（PR7.7）
+
+PR7.7 で BTC レジーム判定（章11.17.5）が `candleSnapshot` を使うようになり、
+ADAPTERS / INFRASTRUCTURE 層に公開 API として `Candle` dataclass と
+`ExchangeProtocol.get_candles` を追加した：
+
+```python
+# src/adapters/exchange.py
+@dataclass(frozen=True)
+class Candle:
+    """ローソク足（章22.7 candleSnapshot）。timestamp_ms は開始時刻。"""
+    symbol: str
+    interval: str
+    timestamp_ms: int
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
+
+
+class ExchangeProtocol(Protocol):
+    async def get_candles(
+        self, symbol: str, interval: str, limit: int = 100
+    ) -> tuple[Candle, ...]:
+        """直近 limit 本のローソク足を返す（古い → 新しい順）。"""
+        ...
+```
+
+実装 (`HyperLiquidClient.get_candles`) は既存の private `_fetch_recent_candles`
+（dict のリストを返す）をラップして `Candle` tuple に変換する：
+
+```python
+async def get_candles(
+    self, symbol: str, interval: str, limit: int = 100
+) -> tuple[Candle, ...]:
+    raw = await self._fetch_recent_candles(symbol, interval, limit)
+    return tuple(
+        Candle(
+            symbol=symbol,
+            interval=interval,
+            timestamp_ms=int(c["t"]),
+            open=Decimal(str(c["o"])),
+            high=Decimal(str(c["h"])),
+            low=Decimal(str(c["l"])),
+            close=Decimal(str(c["c"])),
+            volume=Decimal(str(c["v"])),
+        )
+        for c in raw
+    )
+```
+
+interval 文字列はそのまま HL に渡す（`"15m"` 等）。
+未対応 interval（例: `"7m"`）は `_INTERVAL_MS` の lookup で
+`ExchangeError("Unsupported interval: ...")` を上げる。
 
 #### SDK レスポンスのフィールド仕様（実機検証済み）
 
@@ -6903,6 +7173,100 @@ Phase 0 観察モード用の最小実装。Discord 実装まで `ConsoleNotifie
 
 PR7.5d で DiscordNotifier に差し替え予定。同じ Protocol を満たすので
 `build_scheduler` 側の差し替えは 1 行。
+
+### 25.8 PR7.5d-fix で確定した Notifier 周りの仕様
+
+DiscordNotifier 本実装後、48 時間 Phase 0 観察で **シグナルクラスター発生時に
+5 分間で 18 件単位の同一 DRYRUN 通知が滞留** する事象が発生。
+`dedup_key` を「受け取れる引数」から「実際にすべての通知箇所で使う」運用に
+切り替えた。同時に Notifier Protocol の kwargs 構造を再整理した。
+
+#### 25.8.1 Notifier Protocol の kwargs はメソッドごとに異なる
+
+`send_summary` だけ `dedup_key` / `exception` を持たない。
+日次・週次の定期サマリは「同じ key を抑制すると逆に困る」ので意図的な非対称：
+
+| メソッド | dedup_key | exception | チャンネル |
+|---|---|---|---|
+| `send_signal` | あり | なし | mt-signal |
+| `send_alert` | あり | なし | mt-alert |
+| `send_summary` | **なし** | **なし** | mt-summary |
+| `send_error` | なし | あり | mt-error |
+
+実装は章25.6 のとおり：
+
+```python
+class Notifier(Protocol):
+    async def send_signal(self, message: str, dedup_key: str | None = None) -> None: ...
+    async def send_alert(self, message: str, dedup_key: str | None = None) -> None: ...
+    async def send_summary(self, message: str) -> None: ...
+    async def send_error(self, message: str, exception: Exception | None = None) -> None: ...
+```
+
+注記: `exception` は `send_error` 専用。エラー以外で例外を「ついでに付ける」
+仕組みは作らない（チャンネル分離の意味がなくなる）。
+代わりに alert メッセージ本文に `f": {e}"` を埋め込む運用。
+
+#### 25.8.2 Scheduler の `_safe_notify` 振り分けパターン
+
+`_safe_notify(method_name, message, *, dedup_key=None, exception=None)` を
+`send_summary` 含む全メソッドから呼べるように、`method_name` で kwargs を
+振り分ける。これは将来通知メソッドが増えた時にも踏襲する基盤パターン：
+
+```python
+async def _safe_notify(
+    self,
+    method_name: str,
+    message: str,
+    *,
+    dedup_key: str | None = None,
+    exception: Exception | None = None,
+) -> None:
+    try:
+        method = getattr(self.notifier, method_name)
+        kwargs: dict[str, object] = {}
+        if method_name in ("send_signal", "send_alert"):
+            kwargs["dedup_key"] = dedup_key
+        elif method_name == "send_error":
+            kwargs["exception"] = exception
+        # send_summary は kwargs を渡さない（メッセージのみ）
+        await method(message, **kwargs)
+    except Exception:
+        logger.exception("notification failed: %s", method_name)
+```
+
+#### 25.8.3 dedup_key 命名規則表（PR7.5d-fix で確定）
+
+各通知箇所で使う `dedup_key` の規則を一覧化。`window` は
+`DiscordNotifierConfig.dedup_window_seconds`（既定 300 秒）に従う：
+
+| 通知 | dedup_key | 理由 |
+|---|---|---|
+| BOT 起動 | なし | 1 回のみ発生 |
+| 状態復元完了 | なし | 起動時 1 回 |
+| エントリー実行 | `entry:{trade_id}` | trade_id は一意 |
+| エントリー失敗 | `entry_fail:{symbol}:{direction}` | 同銘柄連続失敗を抑制 |
+| **DRYRUN シグナル** | `dryrun:{symbol}:{direction}` | **クラスター対策・最重要** |
+| FILL 通知 | `fill:{trade_id}` | trade_id は一意 |
+| CLOSE 通知 | `close:{trade_id}` | trade_id は一意 |
+| 強制決済 | `force_close:{symbol}:{reason}` | 連発防止 |
+| 強制決済失敗 | `force_close_fail:{symbol}` | 連発防止 |
+| 外部ポジション検出 | `external:{symbol}` | 同銘柄の連続検出を抑制 |
+| ポジション乖離補正 | `correct:{symbol}` | 連発防止 |
+| 起動時決済記録 | `close_from_fill:{trade_id}` | trade_id は一意 |
+| 手動確認要 | `manual:{trade_id}` | trade_id は一意 |
+| ブレーカー発動 | `cb_active:{reason}` | reason は単一 Enum（章9.15.4） |
+| ブレーカー解除 | `cb_clear` | 解除は同イベント |
+| サイクル例外 | `cycle_error` | 連発抑制 |
+| step 失敗 | `step_fail:{step_name}` | 同 step の連発抑制 |
+
+注記: `cb_active` の reason は単一 Enum 値（`BreakReason.value`）であって、
+複数 reason の sort+join ではない。`check_circuit_breaker` の戻り値が
+最初の発動 1 つだけ（章 9.15.4）なので。
+
+`ConsoleNotifier` は `dedup_key` を受け取って捨てる。
+`DiscordNotifier` だけが実際に dedup する設計。
+プロファイル切替で挙動が変わるが運用上問題なし。
 
 ---
 
