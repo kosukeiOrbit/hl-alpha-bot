@@ -24,7 +24,9 @@ if str(_PROJECT_ROOT) not in sys.path:  # pragma: no cover
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from config.schema import AppSettings  # noqa: E402
+from src.adapters.exchange import ExchangeProtocol  # noqa: E402
 from src.adapters.notifier import Notifier  # noqa: E402
+from src.adapters.sentiment import SentimentProvider  # noqa: E402
 from src.application.entry_flow import (  # noqa: E402
     EntryFlow,
     EntryFlowConfig,
@@ -49,6 +51,10 @@ from src.infrastructure.discord_notifier import (  # noqa: E402
 )
 from src.infrastructure.fixed_sentiment_provider import (  # noqa: E402
     FixedSentimentProvider,
+)
+from src.infrastructure.funding_rate_sentiment_provider import (  # noqa: E402
+    FundingRateSentimentConfig,
+    FundingRateSentimentProvider,
 )
 from src.infrastructure.hyperliquid_client import (  # noqa: E402
     HyperLiquidClient,
@@ -110,6 +116,35 @@ def _build_notifier(secrets: Any) -> Notifier:
     return ConsoleNotifier(use_logging=True)
 
 
+def _build_sentiment_provider(
+    settings: AppSettings, exchange: ExchangeProtocol
+) -> SentimentProvider:
+    """settings.sentiment.provider に応じて SentimentProvider を構築。
+
+    "funding_rate" の場合は HL Funding Rate ベース、それ以外（"fixed" 既定）は
+    FixedSentimentProvider。Phase 0 は fixed、Phase 1 以降で funding_rate に
+    切替（profile_phase1.yaml で設定）。
+    """
+    if settings.sentiment.provider == "funding_rate":
+        logger.info("using FundingRateSentimentProvider")
+        return FundingRateSentimentProvider(
+            exchange,
+            FundingRateSentimentConfig(
+                scale_factor=settings.sentiment.funding_scale_factor,
+                cache_window_seconds=(
+                    settings.sentiment.funding_cache_window_seconds
+                ),
+                confidence=settings.sentiment.funding_confidence,
+            ),
+        )
+    logger.info("using FixedSentimentProvider")
+    return FixedSentimentProvider(
+        score=settings.sentiment.fixed_score,
+        confidence=settings.sentiment.fixed_confidence,
+        reasoning=settings.sentiment.reasoning,
+    )
+
+
 def build_scheduler(
     settings: AppSettings, secrets: Any
 ) -> tuple[Scheduler, SQLiteRepository]:
@@ -125,11 +160,7 @@ def build_scheduler(
     )
     repo = SQLiteRepository(settings.storage.db_path)
     notifier = _build_notifier(secrets)
-    sentiment = FixedSentimentProvider(
-        score=settings.sentiment.fixed_score,
-        confidence=settings.sentiment.fixed_confidence,
-        reasoning=settings.sentiment.reasoning,
-    )
+    sentiment = _build_sentiment_provider(settings, exchange)
 
     entry_flow = EntryFlow(
         exchange=exchange,

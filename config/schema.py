@@ -39,6 +39,13 @@ class WatchlistSettings(BaseModel):
 
 class SentimentSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+    # PR7.5e-1: どの SentimentProvider 実装を使うか
+    # - "fixed":         FixedSentimentProvider（fixed_* で値を固定）
+    # - "funding_rate":  FundingRateSentimentProvider（HL Funding ベース）
+    provider: Literal["fixed", "funding_rate"] = "fixed"
+
+    # FixedSentimentProvider 用
     fixed_score: Decimal = Field(
         ge=Decimal("-1"), le=Decimal("1"), default=Decimal("0")
     )
@@ -46,6 +53,15 @@ class SentimentSettings(BaseModel):
         ge=Decimal("0"), le=Decimal("1"), default=Decimal("0.5")
     )
     reasoning: str = "Phase 0 fixed value"
+
+    # FundingRateSentimentProvider 用
+    funding_scale_factor: Decimal = Field(
+        gt=Decimal("0"), default=Decimal("10000")
+    )
+    funding_cache_window_seconds: int = Field(gt=0, default=300)
+    funding_confidence: Decimal = Field(
+        ge=Decimal("0"), le=Decimal("1"), default=Decimal("0.8")
+    )
 
 
 class StorageSettings(BaseModel):

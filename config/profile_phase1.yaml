@@ -1,0 +1,23 @@
+# Phase 1 プロファイル — settings.yaml の上書き（PR7.5e-1）
+# FundingRateSentimentProvider 使用・実 sentiment 観察。
+#
+# Phase 0 (FixedSentimentProvider score=0.8) との違い:
+#   - sentiment.provider: "funding_rate" で実 sentiment を有効化
+#   - SENTIMENT 層が実際に判定するので、4 層 AND 通過率が下がる可能性
+#   - dry_run はまだ true（実弾投入は別フェーズ）
+
+phase: phase_1
+
+trading:
+  is_dry_run: true              # Phase 1 は dry_run 維持
+  position_size_pct: 0.01
+
+watchlist:
+  directions:
+    - LONG                       # Phase 1 は LONG のみで開始
+
+sentiment:
+  provider: "funding_rate"       # ★ Phase 1 で切替
+  funding_scale_factor: 10000    # 0.0001 (0.01%) で score=±1.0 に飽和
+  funding_cache_window_seconds: 300  # 5 分キャッシュ
+  funding_confidence: 0.8

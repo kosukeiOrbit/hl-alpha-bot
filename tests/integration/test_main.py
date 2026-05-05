@@ -202,6 +202,69 @@ class TestBuildScheduler:
         assert isinstance(scheduler.notifier, DiscordNotifier)
 
 
+# ─── SentimentProvider 切替（PR7.5e-1）─
+
+
+class TestSentimentProviderSwitch:
+    def test_default_uses_fixed_sentiment_provider(self) -> None:
+        # provider 未指定 → "fixed" 既定 → FixedSentimentProvider
+        from src.infrastructure.fixed_sentiment_provider import (
+            FixedSentimentProvider,
+        )
+
+        settings = AppSettings()
+        scheduler, _ = build_scheduler(settings, _make_secrets())
+        assert isinstance(
+            scheduler.entry_flow.sentiment, FixedSentimentProvider
+        )
+
+    def test_funding_rate_provider_selected(self) -> None:
+        # provider="funding_rate" → FundingRateSentimentProvider
+        from src.infrastructure.funding_rate_sentiment_provider import (
+            FundingRateSentimentProvider,
+        )
+
+        settings = AppSettings(
+            sentiment={  # type: ignore[arg-type]
+                "provider": "funding_rate",
+                "funding_scale_factor": "5000",
+                "funding_cache_window_seconds": 600,
+                "funding_confidence": "0.7",
+            }
+        )
+        scheduler, _ = build_scheduler(settings, _make_secrets())
+        assert isinstance(
+            scheduler.entry_flow.sentiment, FundingRateSentimentProvider
+        )
+        # config がそのまま渡る
+        from decimal import Decimal
+
+        assert (
+            scheduler.entry_flow.sentiment.config.scale_factor
+            == Decimal("5000")
+        )
+        assert (
+            scheduler.entry_flow.sentiment.config.cache_window_seconds == 600
+        )
+
+    def test_phase1_profile_loads_funding_rate_provider(self) -> None:
+        # profile_phase1.yaml がそのまま読めて funding_rate を選ぶ
+        from src.core.config_loader import load_settings
+        from src.infrastructure.funding_rate_sentiment_provider import (
+            FundingRateSentimentProvider,
+        )
+
+        settings = load_settings(
+            "config/settings.yaml", "config/profile_phase1.yaml"
+        )
+        assert settings.phase == "phase_1"
+        assert settings.sentiment.provider == "funding_rate"
+        scheduler, _ = build_scheduler(settings, _make_secrets())
+        assert isinstance(
+            scheduler.entry_flow.sentiment, FundingRateSentimentProvider
+        )
+
+
 # ─── setup_logging ──────────────────────
 
 
