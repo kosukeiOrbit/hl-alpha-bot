@@ -379,6 +379,24 @@ class SQLiteRepository:
             row = await cursor.fetchone()
         return Decimal("0") if row is None else Decimal(str(row["total"]))
 
+    async def get_pnl_since(self, since: datetime) -> Decimal:
+        """``since`` 以降に exit した実弾 trades の累計 PnL（章9.7 Layer 2）。"""
+        db = self._require_db()
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=UTC)
+        async with db.execute(
+            """
+            SELECT COALESCE(SUM(pnl_usd), 0) AS total
+            FROM trades
+            WHERE exit_time IS NOT NULL
+              AND exit_time >= ?
+              AND is_dry_run = 0
+            """,
+            (_dt_iso(since),),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return Decimal("0") if row is None else Decimal(str(row["total"]))
+
     async def get_account_balance_history(
         self, days: int
     ) -> tuple[tuple[datetime, Decimal], ...]:

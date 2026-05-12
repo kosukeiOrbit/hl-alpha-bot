@@ -21,13 +21,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Literal
 
-from src.adapters.exchange import ExchangeProtocol
+from src.adapters.exchange import ExchangeError, ExchangeProtocol
 from src.adapters.notifier import Notifier
 from src.adapters.repository import Repository
 from src.application.entry_flow import EntryFlow
@@ -40,6 +41,52 @@ from src.core.circuit_breaker import (
 )
 
 logger = logging.getLogger(__name__)
+
+# CircuitBreaker 用ローソク足取得設定（章9.7 Layer 4/5）
+_LAYER4_INTERVAL = "1m"
+_LAYER4_BARS = 2  # 直近 2 本で 1 本ぶんの変化率を取る
+_LAYER5_SYMBOL = "BTC"
+_LAYER5_INTERVAL = "5m"
+_LAYER5_BARS = 2
+# api_error_rate の rolling window（秒）と最小サンプル数
+_API_TRACKER_WINDOW_SECONDS = 300
+_API_TRACKER_MIN_SAMPLES = 10
+
+
+@dataclass
+class ApiCallTracker:
+    """cycle 単位の成功/失敗を rolling window で記録（章9.7 Layer 6）。
+
+    BOT のメインループ 1 cycle ぶんが「1 API call の単位」。
+    cycle 内のどこかで API が落ちれば失敗、最後まで完走すれば成功。
+    粒度は粗いが、API 全体の不調を観測するには十分。
+
+    再起動でリセットされる（in-memory のみ）。
+    """
+
+    _records: list[tuple[float, bool]] = field(default_factory=list)
+    window_seconds: int = _API_TRACKER_WINDOW_SECONDS
+    min_samples: int = _API_TRACKER_MIN_SAMPLES
+
+    def record_success(self) -> None:
+        self._records.append((time.time(), True))
+        self._prune()
+
+    def record_failure(self) -> None:
+        self._records.append((time.time(), False))
+        self._prune()
+
+    def _prune(self) -> None:
+        cutoff = time.time() - self.window_seconds
+        self._records = [r for r in self._records if r[0] >= cutoff]
+
+    def error_rate(self) -> Decimal:
+        """ ``min_samples`` 未満なら 0 を返す（サンプル不足を発火扱いしない）。"""
+        self._prune()
+        if len(self._records) < self.min_samples:
+            return Decimal("0")
+        failures = sum(1 for _, ok in self._records if not ok)
+        return Decimal(failures) / Decimal(len(self._records))
 
 
 @dataclass(frozen=True)
@@ -108,6 +155,7 @@ class Scheduler:
         self._started_at: datetime | None = None
         self._last_periodic_reconcile_at: datetime | None = None
         self._last_breaker_active = False
+        self._api_tracker = ApiCallTracker()
 
     # ─── 起動・停止 ─────────────────────────
 
@@ -143,8 +191,10 @@ class Scheduler:
                     "active" if stats.circuit_breaker_active else "off",
                     stats.duration_seconds,
                 )
+                self._api_tracker.record_success()
             except Exception:
                 logger.exception("cycle failed")
+                self._api_tracker.record_failure()
                 await self._safe_notify(
                     "send_alert",
                     "unexpected exception in cycle (continuing next cycle)",
@@ -277,36 +327,53 @@ class Scheduler:
         return check_circuit_breaker(inputs)
 
     async def _build_breaker_input(self) -> BreakerInput:
-        """BreakerInput を組む。
+        """BreakerInput を実値で組む（章9.7 全 7 Layer 対応）。
 
-        取れる指標:
-        - balance: exchange.get_account_balance_usd
-        - daily_pnl: repo.get_daily_pnl_usd
-        - consecutive_losses: repo.get_consecutive_losses
-        - position_count: exchange.get_positions
-        Phase 0 で取れない指標は 0/空で埋める（後続 PR で WS 等から）。
+        PR7.4-real で placeholder（weekly_loss_pct=0 / 1m/5m=0 / api_err=0）を
+        すべて実値に置き換え。各 _compute_* は個別に try/except し、エラー時は
+        安全側のデフォルト（0 / 空 tuple）を返すので、1 つの指標取得失敗で
+        他の Layer の判定が無効化されることはない。
         """
         balance = await self.exchange.get_account_balance_usd()
-        positions = await self.exchange.get_positions()
-        consecutive = await self.repo.get_consecutive_losses()
-        today_utc = datetime.now(UTC).replace(
-            hour=0, minute=0, second=0, microsecond=0
+        now_utc = datetime.now(UTC)
+        today_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        week_ago = now_utc - timedelta(days=7)
+
+        # 独立した取得は並行化（cycle 時間短縮）
+        (
+            positions,
+            consecutive,
+            daily_pnl,
+            weekly_pnl,
+            symbol_changes,
+            btc_5min_change,
+        ) = await asyncio.gather(
+            self.exchange.get_positions(),
+            self.repo.get_consecutive_losses(),
+            self.repo.get_daily_pnl_usd(today_utc),
+            self.repo.get_pnl_since(week_ago),
+            self._compute_symbol_1min_changes_pct(self.config.watchlist),
+            self._compute_btc_5min_change_pct(),
         )
-        daily_pnl = await self.repo.get_daily_pnl_usd(today_utc)
 
         daily_loss_pct = (
             (daily_pnl / balance) * Decimal("100")
             if balance > 0
             else Decimal("0")
         )
+        weekly_loss_pct = (
+            (weekly_pnl / balance) * Decimal("100")
+            if balance > 0
+            else Decimal("0")
+        )
 
         return BreakerInput(
             daily_loss_pct=daily_loss_pct,
-            weekly_loss_pct=Decimal("0"),  # Phase 0 未対応
+            weekly_loss_pct=weekly_loss_pct,
             consecutive_losses=consecutive,
-            symbol_1min_changes_pct=(),  # Phase 0 未対応（WS trades 待ち）
-            btc_5min_change_pct=Decimal("0"),  # 同上
-            api_error_rate_5min=Decimal("0"),  # 同上（エラー追跡なし）
+            symbol_1min_changes_pct=symbol_changes,
+            btc_5min_change_pct=btc_5min_change,
+            api_error_rate_5min=self._api_tracker.error_rate(),
             position_count=len(positions),
             max_position_count=self.config.max_position_count,
             daily_loss_limit_pct=self.config.daily_loss_limit_pct,
@@ -319,6 +386,54 @@ class Scheduler:
                 self.config.position_overflow_multiplier
             ),
         )
+
+    async def _compute_symbol_1min_changes_pct(
+        self, symbols: tuple[str, ...]
+    ) -> tuple[tuple[str, Decimal], ...]:
+        """各銘柄の直近 1m 足の close 変化率（章9.7 Layer 4 FLASH_CRASH）。
+
+        2 本のローソク足を取得し ``(curr - prev) / prev * 100`` を計算。
+        symbol 単位で try/except し、失敗銘柄は結果から除外する。
+        """
+        results: list[tuple[str, Decimal]] = []
+        for symbol in symbols:
+            try:
+                candles = await self.exchange.get_candles(
+                    symbol, _LAYER4_INTERVAL, _LAYER4_BARS
+                )
+            except ExchangeError as e:
+                logger.warning(
+                    "1m change fetch failed for %s: %s, skipping", symbol, e
+                )
+                continue
+            if len(candles) < 2:
+                continue
+            prev = candles[-2].close
+            curr = candles[-1].close
+            if prev == 0:
+                continue
+            results.append((symbol, (curr - prev) / prev * Decimal("100")))
+        return tuple(results)
+
+    async def _compute_btc_5min_change_pct(self) -> Decimal:
+        """BTC 直近 5m 足の close 変化率（章9.7 Layer 5 BTC_ANOMALY）。
+
+        取得失敗時は 0 を返す（安全側: ブレーカーは発動しない）。
+        """
+        try:
+            candles = await self.exchange.get_candles(
+                _LAYER5_SYMBOL, _LAYER5_INTERVAL, _LAYER5_BARS
+            )
+        except ExchangeError as e:
+            logger.warning("BTC 5m change fetch failed: %s, using 0", e)
+            return Decimal("0")
+        if len(candles) < 2:
+            return Decimal("0")
+        prev = candles[-2].close
+        curr = candles[-1].close
+        if prev == 0:
+            return Decimal("0")
+        return (curr - prev) / prev * Decimal("100")
 
     async def _notify_breaker_transition(self, result: BreakerResult) -> None:
         """ブレーカー状態の遷移時のみ通知。"""

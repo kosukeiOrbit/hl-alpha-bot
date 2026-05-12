@@ -13,6 +13,7 @@ from src.application.entry_flow import EntryAttempt
 from src.application.position_monitor import MonitorCycleResult
 from src.application.reconciliation import ReconcileSummary
 from src.application.scheduler import (
+    ApiCallTracker,
     Scheduler,
     SchedulerConfig,
 )
@@ -121,10 +122,15 @@ def build_scheduler(
     else:
         exchange.get_account_balance_usd = AsyncMock(return_value=balance)
     exchange.get_positions = AsyncMock(return_value=positions)
+    # PR7.4-real: _build_breaker_input が候補銘柄の 1m / BTC 5m を取りに行く。
+    # デフォルトは空 tuple = Layer 4/5 はサンプル不足で 0 扱いになる。
+    exchange.get_candles = AsyncMock(return_value=())
 
     repo = AsyncMock()
     repo.get_consecutive_losses = AsyncMock(return_value=consecutive_losses)
     repo.get_daily_pnl_usd = AsyncMock(return_value=daily_pnl)
+    # PR7.4-real: weekly_loss_pct 計算用
+    repo.get_pnl_since = AsyncMock(return_value=Decimal("0"))
 
     notifier = AsyncMock()
     if notifier_side_effect is not None:
@@ -627,3 +633,233 @@ class TestStatsShape:
         )
         with pytest.raises(FrozenInstanceError):
             stats.entry_executed = 5  # type: ignore[misc]
+
+
+# ─── PR7.4-real: ApiCallTracker ─────────
+
+
+class TestApiCallTracker:
+    def test_records_success(self) -> None:
+        t = ApiCallTracker(min_samples=1)
+        t.record_success()
+        assert t.error_rate() == Decimal("0")
+
+    def test_records_failure(self) -> None:
+        t = ApiCallTracker(min_samples=1)
+        t.record_failure()
+        assert t.error_rate() == Decimal("1")
+
+    def test_mixed_records_returns_ratio(self) -> None:
+        t = ApiCallTracker(min_samples=1)
+        for _ in range(7):
+            t.record_success()
+        for _ in range(3):
+            t.record_failure()
+        assert t.error_rate() == Decimal("0.3")
+
+    def test_below_min_samples_returns_zero(self) -> None:
+        # 既定 min_samples=10。9 件だと 0 を返す
+        t = ApiCallTracker()
+        for _ in range(9):
+            t.record_failure()
+        assert t.error_rate() == Decimal("0")
+
+    def test_prunes_old_records(self) -> None:
+        # window=0.05s に縮めて経過後に古い記録が落ちることを確認
+        t = ApiCallTracker(window_seconds=0, min_samples=1)
+        t.record_failure()
+        # _prune は record の度に呼ばれる。次の record で過去分が削除される。
+        import time as _time
+
+        _time.sleep(0.01)
+        t.record_success()
+        # 古い failure は削除済み → success 1 件のみ
+        assert t.error_rate() == Decimal("0")
+
+
+# ─── PR7.4-real: Layer 2/4/5 実値計算 ──
+
+
+def _make_candle(close: str, ts: int = 0) -> Any:
+    """get_candles の戻り値で必要なのは .close だけ。"""
+    c = MagicMock()
+    c.close = Decimal(close)
+    c.timestamp_ms = ts
+    return c
+
+
+class TestComputeSymbol1minChanges:
+    @pytest.mark.asyncio
+    async def test_returns_change_for_each_symbol(self) -> None:
+        scheduler, exchange, _, _, _, _, _ = build_scheduler()
+        exchange.get_candles = AsyncMock(
+            side_effect=[
+                (_make_candle("100"), _make_candle("102")),  # BTC +2%
+                (_make_candle("200"), _make_candle("199")),  # ETH -0.5%
+            ]
+        )
+        result = await scheduler._compute_symbol_1min_changes_pct(
+            ("BTC", "ETH")
+        )
+        assert result == (
+            ("BTC", Decimal("2")),
+            ("ETH", Decimal("-0.5")),
+        )
+
+    @pytest.mark.asyncio
+    async def test_skips_symbol_on_fetch_error(self) -> None:
+        from src.adapters.exchange import ExchangeError
+
+        scheduler, exchange, _, _, _, _, _ = build_scheduler()
+        exchange.get_candles = AsyncMock(
+            side_effect=[
+                ExchangeError("api down"),  # BTC fails
+                (_make_candle("200"), _make_candle("202")),  # ETH +1%
+            ]
+        )
+        result = await scheduler._compute_symbol_1min_changes_pct(
+            ("BTC", "ETH")
+        )
+        # BTC は除外、ETH だけ
+        assert result == (("ETH", Decimal("1")),)
+
+    @pytest.mark.asyncio
+    async def test_skips_when_fewer_than_2_candles(self) -> None:
+        scheduler, exchange, _, _, _, _, _ = build_scheduler()
+        exchange.get_candles = AsyncMock(return_value=(_make_candle("100"),))
+        result = await scheduler._compute_symbol_1min_changes_pct(("BTC",))
+        assert result == ()
+
+    @pytest.mark.asyncio
+    async def test_skips_when_prev_close_zero(self) -> None:
+        scheduler, exchange, _, _, _, _, _ = build_scheduler()
+        exchange.get_candles = AsyncMock(
+            return_value=(_make_candle("0"), _make_candle("100"))
+        )
+        result = await scheduler._compute_symbol_1min_changes_pct(("BTC",))
+        assert result == ()
+
+
+class TestComputeBtc5minChange:
+    @pytest.mark.asyncio
+    async def test_returns_change_pct(self) -> None:
+        scheduler, exchange, _, _, _, _, _ = build_scheduler()
+        exchange.get_candles = AsyncMock(
+            return_value=(_make_candle("65000"), _make_candle("65650"))
+        )
+        result = await scheduler._compute_btc_5min_change_pct()
+        assert result == Decimal("1")
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_on_exchange_error(self) -> None:
+        from src.adapters.exchange import ExchangeError
+
+        scheduler, exchange, _, _, _, _, _ = build_scheduler()
+        exchange.get_candles = AsyncMock(
+            side_effect=ExchangeError("api down")
+        )
+        assert await scheduler._compute_btc_5min_change_pct() == Decimal("0")
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_when_too_few_candles(self) -> None:
+        scheduler, exchange, _, _, _, _, _ = build_scheduler()
+        exchange.get_candles = AsyncMock(return_value=())
+        assert await scheduler._compute_btc_5min_change_pct() == Decimal("0")
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_when_prev_close_zero(self) -> None:
+        scheduler, exchange, _, _, _, _, _ = build_scheduler()
+        exchange.get_candles = AsyncMock(
+            return_value=(_make_candle("0"), _make_candle("65000"))
+        )
+        assert await scheduler._compute_btc_5min_change_pct() == Decimal("0")
+
+
+# ─── PR7.4-real: _build_breaker_input 統合 ──
+
+
+class TestBuildBreakerInputRealValues:
+    @pytest.mark.asyncio
+    async def test_weekly_loss_pct_from_repo(self) -> None:
+        scheduler, _, repo, _, _, _, _ = build_scheduler(
+            balance=Decimal("1000"),
+        )
+        repo.get_pnl_since = AsyncMock(return_value=Decimal("-80"))
+        inputs = await scheduler._build_breaker_input()
+        # -80 / 1000 * 100 = -8.0%
+        assert inputs.weekly_loss_pct == Decimal("-8")
+
+    @pytest.mark.asyncio
+    async def test_weekly_loss_pct_zero_when_balance_zero(self) -> None:
+        scheduler, _, repo, _, _, _, _ = build_scheduler(
+            balance=Decimal("0"),
+        )
+        repo.get_pnl_since = AsyncMock(return_value=Decimal("-100"))
+        inputs = await scheduler._build_breaker_input()
+        assert inputs.weekly_loss_pct == Decimal("0")
+
+    @pytest.mark.asyncio
+    async def test_symbol_1min_changes_propagated(self) -> None:
+        scheduler, exchange, _, _, _, _, _ = build_scheduler()
+        exchange.get_candles = AsyncMock(
+            side_effect=[
+                # _build_breaker_input は asyncio.gather で
+                # symbol_1min_changes → btc_5min_change の順で呼ぶが、
+                # 内部実装は: 各 symbol の 1m, その後 BTC の 5m
+                # gather なので同時、call 順は確定。BTC, ETH の 1m 後に BTC 5m。
+                (_make_candle("100"), _make_candle("101")),  # BTC 1m +1%
+                (_make_candle("200"), _make_candle("201")),  # ETH 1m +0.5%
+                (_make_candle("100"), _make_candle("103")),  # BTC 5m +3%
+            ]
+        )
+        inputs = await scheduler._build_breaker_input()
+        assert inputs.symbol_1min_changes_pct == (
+            ("BTC", Decimal("1")),
+            ("ETH", Decimal("0.5")),
+        )
+        assert inputs.btc_5min_change_pct == Decimal("3")
+
+    @pytest.mark.asyncio
+    async def test_api_error_rate_from_tracker(self) -> None:
+        scheduler, _, _, _, _, _, _ = build_scheduler()
+        scheduler._api_tracker = ApiCallTracker(min_samples=1)
+        for _ in range(2):
+            scheduler._api_tracker.record_failure()
+        for _ in range(8):
+            scheduler._api_tracker.record_success()
+        inputs = await scheduler._build_breaker_input()
+        assert inputs.api_error_rate_5min == Decimal("0.2")
+
+
+# ─── PR7.4-real: run() の cycle tracking ─
+
+
+class TestRunRecordsApiOutcome:
+    @pytest.mark.asyncio
+    async def test_successful_cycle_records_success(self) -> None:
+        scheduler, _, _, _, _, _, _ = build_scheduler(
+            config=make_config(cycle_interval_seconds=0.01)
+        )
+
+        async def shutdown_soon() -> None:
+            await asyncio.sleep(0.05)
+            scheduler.request_shutdown()
+
+        await asyncio.gather(scheduler.run(), shutdown_soon())
+        # 1 cycle 以上回ったので success が記録されている
+        assert any(ok for _, ok in scheduler._api_tracker._records)
+
+    @pytest.mark.asyncio
+    async def test_failing_cycle_records_failure(self) -> None:
+        scheduler, _, _, _, _, _, _ = build_scheduler(
+            config=make_config(cycle_interval_seconds=0.01),
+            monitor_side_effect=RuntimeError("boom"),
+        )
+
+        async def shutdown_soon() -> None:
+            await asyncio.sleep(0.05)
+            scheduler.request_shutdown()
+
+        await asyncio.gather(scheduler.run(), shutdown_soon())
+        # run_cycle_once が例外を上げる構成 → failure が記録
+        assert any(not ok for _, ok in scheduler._api_tracker._records)

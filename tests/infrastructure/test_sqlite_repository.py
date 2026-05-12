@@ -444,6 +444,54 @@ class TestDailyPnl:
         assert result == Decimal("1.0")
 
 
+# ─── get_pnl_since（PR7.4-real Layer 2） ──
+
+
+class TestGetPnlSince:
+    @pytest.mark.asyncio
+    async def test_no_trades_returns_zero(
+        self, repo: SQLiteRepository
+    ) -> None:
+        since = datetime.now(UTC) - timedelta(days=7)
+        assert await repo.get_pnl_since(since) == Decimal("0")
+
+    @pytest.mark.asyncio
+    async def test_sums_recent_trades(
+        self, repo: SQLiteRepository
+    ) -> None:
+        for pnl in [2.0, -0.5, 1.0]:
+            tid = await repo.open_trade(make_open_request())
+            await repo.close_trade(
+                make_close_request(tid, pnl_usd=Decimal(str(pnl)))
+            )
+        since = datetime.now(UTC) - timedelta(days=7)
+        assert await repo.get_pnl_since(since) == Decimal("2.5")
+
+    @pytest.mark.asyncio
+    async def test_excludes_dry_run(
+        self, repo: SQLiteRepository
+    ) -> None:
+        tid = await repo.open_trade(make_open_request(is_dry_run=True))
+        await repo.close_trade(
+            make_close_request(tid, pnl_usd=Decimal("100"))
+        )
+        since = datetime.now(UTC) - timedelta(days=7)
+        assert await repo.get_pnl_since(since) == Decimal("0")
+
+    @pytest.mark.asyncio
+    async def test_naive_datetime_treated_as_utc(
+        self, repo: SQLiteRepository
+    ) -> None:
+        tid = await repo.open_trade(make_open_request())
+        await repo.close_trade(
+            make_close_request(tid, pnl_usd=Decimal("3.0"))
+        )
+        naive_since = (datetime.now(UTC) - timedelta(hours=1)).replace(
+            tzinfo=None
+        )
+        assert await repo.get_pnl_since(naive_since) == Decimal("3.0")
+
+
 # ─── balance_history ───────────────────
 
 
