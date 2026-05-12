@@ -473,26 +473,55 @@ class TestUTCDayOpenPrice:
         client._info.candles_snapshot = MagicMock(
             return_value=[{"t": 0, "o": "65432.1", "c": "65500", "v": "100"}]
         )
-        result = await client._get_utc_day_open_price("BTC")
+        result = await client._get_utc_day_open_price(
+            "BTC", fallback_price=Decimal("70000")
+        )
+        # ローソク足が取れた → fallback ではなく open を返す
         assert result == Decimal("65432.1")
 
     @pytest.mark.asyncio
-    async def test_no_candle_raises(self) -> None:
+    async def test_falls_back_when_no_candle(self) -> None:
+        """PR7.x-fix: 空応答時は fallback_price を返してメインループを止めない。"""
         client = HyperLiquidClient(network="testnet")
         client._info = MagicMock()
         client._info.candles_snapshot = MagicMock(return_value=[])
-        with pytest.raises(ExchangeError, match="No UTC 00:00 candle"):
-            await client._get_utc_day_open_price("BTC")
+        result = await client._get_utc_day_open_price(
+            "ETH", fallback_price=Decimal("3000")
+        )
+        assert result == Decimal("3000")
 
     @pytest.mark.asyncio
-    async def test_sdk_error_propagates(self) -> None:
+    async def test_falls_back_when_sdk_raises(self) -> None:
+        """PR7.x-fix: candles_snapshot 例外時も fallback_price で継続。"""
         client = HyperLiquidClient(network="testnet")
         client._info = MagicMock()
         client._info.candles_snapshot = MagicMock(
             side_effect=Exception("network error")
         )
-        with pytest.raises(ExchangeError, match="Failed to fetch UTC open"):
-            await client._get_utc_day_open_price("BTC")
+        result = await client._get_utc_day_open_price(
+            "BTC", fallback_price=Decimal("65000")
+        )
+        assert result == Decimal("65000")
+
+    @pytest.mark.asyncio
+    async def test_falls_back_logs_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """fallback 発動を warning ログで可視化する。"""
+        import logging as _logging
+
+        client = HyperLiquidClient(network="testnet")
+        client._info = MagicMock()
+        client._info.candles_snapshot = MagicMock(return_value=[])
+        with caplog.at_level(
+            _logging.WARNING, logger="src.infrastructure.hyperliquid_client"
+        ):
+            await client._get_utc_day_open_price(
+                "ETH", fallback_price=Decimal("3000")
+            )
+        assert any(
+            "No UTC 00:00 candle for ETH" in r.message for r in caplog.records
+        )
 
 
 # ────────────────────────────────────────────────

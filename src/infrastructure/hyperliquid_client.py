@@ -339,7 +339,9 @@ class HyperLiquidClient:
             Decimal("1") if avg_volume == 0 else volume_5min_recent / avg_volume
         )
 
-        utc_open_price = await self._get_utc_day_open_price(symbol)
+        utc_open_price = await self._get_utc_day_open_price(
+            symbol, fallback_price=current_price
+        )
 
         flow_buy_usd, flow_sell_usd = await self._estimate_flow_from_book(symbol)
         flow_buy_sell_ratio = (
@@ -418,8 +420,23 @@ class HyperLiquidClient:
             for c in raw
         )
 
-    async def _get_utc_day_open_price(self, symbol: str) -> Decimal:
-        """当日 UTC 00:00 の始値を取得（1h 足の最初のローソクの open）。"""
+    async def _get_utc_day_open_price(
+        self, symbol: str, fallback_price: Decimal
+    ) -> Decimal:
+        """当日 UTC 00:00 の始値を取得（1h 足の最初のローソクの open）。
+
+        PR7.x-fix: ローソク足取得失敗 / 空応答時は ExchangeError を投げず
+        ``fallback_price`` を返してメインループを止めない（章19 の継続稼働
+        ポリシー）。fallback_price は呼び出し側 (`get_market_snapshot`) で
+        既に取得済みの current_price (= markPx) を渡す。
+
+        本来の utc_open_price は MOMENTUM 補助フィルタの参照点で、現値で
+        代用しても LONG 判定が常に False 側に振れるだけ（安全側）。
+
+        2 日で 6 回観察された ``No UTC 00:00 candle found`` ERROR は HL 側で
+        00:00 の 1h 足が一時的に未配信になるケース（連続 4 cycle 続くことが
+        ある）。発生頻度 0.035% でも cycle 全停止は本番運用で許容不能。
+        """
         now_utc = datetime.now(UTC)
         utc_midnight = datetime(
             now_utc.year, now_utc.month, now_utc.day, tzinfo=UTC
@@ -431,11 +448,23 @@ class HyperLiquidClient:
                 self.info.candles_snapshot, symbol, "1h", start_ms, end_ms
             )
         except Exception as e:
-            raise ExchangeError(
-                f"Failed to fetch UTC open candle for {symbol}: {e}"
-            ) from e
+            logger.warning(
+                "Failed to fetch UTC 00:00 candle for %s: %s, "
+                "falling back to current_price %s",
+                symbol,
+                e,
+                fallback_price,
+            )
+            return fallback_price
         if not response:
-            raise ExchangeError(f"No UTC 00:00 candle found for {symbol}")
+            logger.warning(
+                "No UTC 00:00 candle for %s (start_ms=%d), "
+                "falling back to current_price %s",
+                symbol,
+                start_ms,
+                fallback_price,
+            )
+            return fallback_price
         return Decimal(str(response[0]["o"]))
 
     async def _estimate_flow_from_book(self, symbol: str) -> tuple[Decimal, Decimal]:
