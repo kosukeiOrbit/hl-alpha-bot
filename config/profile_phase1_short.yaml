@@ -1,0 +1,30 @@
+# Phase 1 + SHORT 検証用プロファイル
+# - LONG/SHORT 両方で観察
+# - dry_run=true で実害なし
+# - SHORT 実装の実機統合テストが目的
+# - HL API rate-limit 回避のため cycle=20s
+#
+# testnet では現状:
+#   - funding 過剰 LONG → SENTIMENT bearish 領域に頻繁にいる (score < -0.3)
+#   - BTC DOWNTREND → REGIME 通過
+#   - MOMENTUM SHORT が出れば 4層通過の可能性あり
+
+phase: phase_1
+
+trading:
+  is_dry_run: true              # SHORT は無限損失リスクのため特に重要
+
+watchlist:
+  directions:
+    - LONG
+    - SHORT                      # ★ 追加
+
+sentiment:
+  provider: "funding_rate"
+  funding_scale_factor: 1000     # phase1.yaml と同じチューニング
+  funding_cache_window_seconds: 300
+  funding_confidence: 0.8
+
+# ★ API 負荷を下げて 429 回避（10s × attempts=4 でレート制限に当たる）
+scheduler:
+  cycle_interval_seconds: 20
