@@ -18,6 +18,6 @@ watchlist:
 
 sentiment:
   provider: "funding_rate"       # ★ Phase 1 で切替
-  funding_scale_factor: 10000    # 0.0001 (0.01%) で score=±1.0 に飽和
+  funding_scale_factor: 1000    # 0.0001 (0.01%) で score=±1.0 に飽和
   funding_cache_window_seconds: 300  # 5 分キャッシュ
   funding_confidence: 0.8
