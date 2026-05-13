@@ -580,6 +580,119 @@ class TestErrorHandling:
         repo.open_trade.assert_not_awaited()
 
 
+# ─── silent rejection 可視化（mainnet 観察対応） ─────
+
+
+class TestSilentRejectionVisibility:
+    """4 層通過 + 非 dry_run で発注に至らなかった場合の log + alert。
+
+    PR7.4-real 以降の mainnet 観察で「4 層通過 5 件・trades 空」が発生し、
+    silent rejection 経路に log/alert が無いことが原因と判明。
+    挙動変更なし（return 値は同じ）、観察可能性のみ追加。
+    """
+
+    @pytest.mark.asyncio
+    async def test_size_too_small_logs_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging as _logging
+
+        flow, _, _, _, _ = build_flow(balance=Decimal("0"))
+        with caplog.at_level(
+            _logging.WARNING, logger="src.application.entry_flow"
+        ):
+            await flow.evaluate_and_enter("ETH", "LONG")
+        assert any(
+            "entry skipped (size too small)" in r.message
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_size_too_small_sends_alert_with_dedup_key(self) -> None:
+        flow, _, _, _, notifier = build_flow(balance=Decimal("0"))
+        await flow.evaluate_and_enter("ETH", "LONG")
+        # ALO の OrderRejectedError 用 send_alert と区別された dedup_key を使う
+        size_call = next(
+            (
+                c
+                for c in notifier.send_alert.await_args_list
+                if "size too small" in c.args[0]
+            ),
+            None,
+        )
+        assert size_call is not None
+        assert size_call.kwargs["dedup_key"] == "entry_skip_size:ETH:LONG"
+
+    @pytest.mark.asyncio
+    async def test_order_not_placed_logs_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging as _logging
+
+        results = make_grouped_results(entry_oid=None, entry_success=False)
+        results = (
+            replace(results[0], rejected_reason="Post only would have matched"),
+            results[1],
+            results[2],
+        )
+        flow, _, _, _, _ = build_flow(grouped_results=results)
+        with caplog.at_level(
+            _logging.WARNING, logger="src.application.entry_flow"
+        ):
+            await flow.evaluate_and_enter("ETH", "LONG")
+        warn = next(
+            (
+                r
+                for r in caplog.records
+                if "entry skipped (order not placed)" in r.message
+            ),
+            None,
+        )
+        assert warn is not None
+        # logger.warning に reason が含まれていること
+        assert "Post only would have matched" in warn.message
+
+    @pytest.mark.asyncio
+    async def test_order_not_placed_sends_alert_with_dedup_key(self) -> None:
+        results = make_grouped_results(entry_oid=None, entry_success=False)
+        results = (
+            replace(results[0], rejected_reason="Post only would have matched"),
+            results[1],
+            results[2],
+        )
+        flow, _, _, _, notifier = build_flow(grouped_results=results)
+        await flow.evaluate_and_enter("ETH", "LONG")
+        reject_call = next(
+            (
+                c
+                for c in notifier.send_alert.await_args_list
+                if "order not placed" in c.args[0]
+            ),
+            None,
+        )
+        assert reject_call is not None
+        assert reject_call.kwargs["dedup_key"] == "entry_skip_reject:ETH:LONG"
+        # メッセージに reason が含まれること（運用側で原因が分かる）
+        assert "Post only would have matched" in reject_call.args[0]
+
+    @pytest.mark.asyncio
+    async def test_entry_not_filled_default_reason_in_alert(self) -> None:
+        # results が success=True だが order_id=None の珍ケース（rejected_reason なし）
+        results = make_grouped_results(entry_oid=None, entry_success=True)
+        flow, _, _, _, notifier = build_flow(grouped_results=results)
+        await flow.evaluate_and_enter("ETH", "LONG")
+        reject_call = next(
+            (
+                c
+                for c in notifier.send_alert.await_args_list
+                if "order not placed" in c.args[0]
+            ),
+            None,
+        )
+        assert reject_call is not None
+        assert "entry_not_filled" in reject_call.args[0]
+
+
 # ─── 判定で落ちるケース ─────────────────────────────
 
 

@@ -394,6 +394,22 @@ class EntryFlow:
             )
         )
         if sizing.size_coins <= 0:
+            reason = sizing.rejected_reason or "size_too_small"
+            logger.warning(
+                "entry skipped (size too small): %s %s reason=%s "
+                "balance=%s notional=%s sz_decimals=%s",
+                snapshot.symbol,
+                direction,
+                reason,
+                balance,
+                sizing.notional_usd,
+                sz_decimals,
+            )
+            await self.notifier.send_alert(
+                f"entry skipped (size too small): {snapshot.symbol} "
+                f"{direction} reason={reason}",
+                dedup_key=f"entry_skip_size:{snapshot.symbol}:{direction}",
+            )
             return EntryAttempt(
                 symbol=snapshot.symbol,
                 direction=direction,
@@ -401,7 +417,7 @@ class EntryFlow:
                 executed=False,
                 is_dry_run=False,
                 trade_id=None,
-                rejected_reason=sizing.rejected_reason or "size_too_small",
+                rejected_reason=reason,
                 snapshot=snapshot,
             )
 
@@ -470,6 +486,24 @@ class EntryFlow:
                 results[0].rejected_reason
                 if results and results[0].rejected_reason
                 else "entry_not_filled"
+            )
+            # PR7.4-real 後の運用観察で判明: place_orders_grouped は HL から
+            # statuses[0].error が来ても例外を投げず success=False で return
+            # する（hyperliquid_client._grouped_status_to_result）。単発
+            # place_order の _raise_inner_error 経路と非対称。silent rejection
+            # で 4 層通過しても trades にも incidents にも何も残らない問題が
+            # mainnet で実観測された (5/13 ETH SHORT 5 件)。ここで最低限の
+            # 可視化を行う（構造的修正は別 PR）。
+            logger.warning(
+                "entry skipped (order not placed): %s %s reason=%s",
+                snapshot.symbol,
+                direction,
+                entry_reason,
+            )
+            await self.notifier.send_alert(
+                f"entry skipped (order not placed): {snapshot.symbol} "
+                f"{direction} reason={entry_reason}",
+                dedup_key=f"entry_skip_reject:{snapshot.symbol}:{direction}",
             )
             return EntryAttempt(
                 symbol=snapshot.symbol,
