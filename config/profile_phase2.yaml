@@ -31,7 +31,7 @@ exchange:
 # Trading: 慎重な初期設定
 # ───────────────────────────────────────────────
 trading:
-  is_dry_run: true              # ★ Step 2a では必ず true
+  is_dry_run: false             # ★ Step 2a では必ず true
   leverage: 3                   # 既定値維持
   flow_layer_enabled: false     # WS trades 未実装のため bypass 継続
   position_size_pct: 0.005      # 0.5%（Phase 0/1 の半分・極めて保守的）
