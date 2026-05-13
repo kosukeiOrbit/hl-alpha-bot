@@ -34,7 +34,7 @@ trading:
   is_dry_run: false             # ★ Step 2a では必ず true
   leverage: 3                   # 既定値維持
   flow_layer_enabled: false     # WS trades 未実装のため bypass 継続
-  position_size_pct: 0.005      # 0.5%（Phase 0/1 の半分・極めて保守的）
+  position_size_pct: 0.02	# 0.5%（Phase 0/1 の半分・極めて保守的）
   sl_atr_mult: 1.5              # ATR ベース SL
   tp_atr_mult: 3.0              # ATR ベース TP (リスクリワード 1:2)
 
