@@ -1,0 +1,93 @@
+# Phase 2 プロファイル — mainnet 接続・実弾投入の入り口
+#
+# ⚠️ 重要: 最初は必ず is_dry_run=true で mainnet データを観察すること
+#
+# Step 2a (この yaml の初期状態):
+#   - mainnet 接続確認
+#   - mainnet の funding rate / sentiment 観察
+#   - dry_run=true で実弾なし
+#   - 24h 以上観察してから Step 2b へ
+#
+# Step 2b への移行手順 (別途実弾投入時):
+#   1. mainnet に 100 USDC + Arbitrum ETH(ガス代) 入金
+#      (5 USDC では最小注文額 $10 に届かないため)
+#   2. verify_phase0.py が緑であることを確認
+#   3. このファイルの trading.is_dry_run を false に変更
+#   4. BOT 再起動
+#
+# Step 2c (実弾投入後・段階的増額):
+#   - 動作確認後に position_size_pct を 0.005 → 0.01 → 0.02 と増やす
+#   - mainnet 残高を 100 → 250 → 500 → 1000 USDC と増やす
+
+phase: phase_2
+
+# ───────────────────────────────────────────────
+# Exchange: mainnet に切替（重要）
+# ───────────────────────────────────────────────
+exchange:
+  network: mainnet              # ★ testnet → mainnet
+
+# ───────────────────────────────────────────────
+# Trading: 慎重な初期設定
+# ───────────────────────────────────────────────
+trading:
+  is_dry_run: true              # ★ Step 2a では必ず true
+  leverage: 3                   # 既定値維持
+  flow_layer_enabled: false     # WS trades 未実装のため bypass 継続
+  position_size_pct: 0.005      # 0.5%（Phase 0/1 の半分・極めて保守的）
+  sl_atr_mult: 1.5              # ATR ベース SL
+  tp_atr_mult: 3.0              # ATR ベース TP (リスクリワード 1:2)
+
+# ───────────────────────────────────────────────
+# Watchlist: LONG のみで開始（SHORT は別途検証後）
+# ───────────────────────────────────────────────
+watchlist:
+  fixed:
+    - BTC
+    - ETH
+  directions:
+    - LONG
+    # - SHORT  ← mainnet で慎重に検証後に追加
+
+# ───────────────────────────────────────────────
+# Sentiment: mainnet では scale_factor を 10000 に戻す
+# ───────────────────────────────────────────────
+# 理由:
+#   testnet では 1000 にチューニングしたが、これは testnet の
+#   過剰 LONG 常態化（funding > 0.0001 が常態）への対策。
+#   mainnet では funding は ±0.0001 程度の中立帯が普通なので
+#   標準の 10000 に戻す。
+sentiment:
+  provider: "funding_rate"
+  funding_scale_factor: 10000   # ★ testnet 用 1000 → mainnet 標準 10000 に戻す
+  funding_cache_window_seconds: 300
+  funding_confidence: 0.8
+
+# ───────────────────────────────────────────────
+# Scheduler: 慎重な間隔・リスク限界を厳しめに
+# ───────────────────────────────────────────────
+scheduler:
+  cycle_interval_seconds: 20.0  # ★ 10s → 20s で API 負荷を抑える（testnet 観察ベース）
+  reconcile_interval_seconds: 300.0
+  circuit_breaker_enabled: true
+  
+  # ポジション数制限（厳しめ）
+  max_position_count: 1         # ★ Phase 2 初期は 1 ポジションのみ
+  
+  # 損失制限（厳しめ）
+  daily_loss_limit_pct: 2.0     # ★ 標準 3.0 → 2.0 に厳しく
+  weekly_loss_limit_pct: 5.0    # ★ 標準 8.0 → 5.0 に厳しく
+  consecutive_loss_limit: 2     # ★ 標準 3 → 2 に厳しく
+  
+  # 価格変動制限（標準）
+  flash_crash_threshold_pct: 5.0
+  btc_anomaly_threshold_pct: 3.0
+  api_error_rate_max: 0.30
+  position_overflow_multiplier: 1.5
+
+# ───────────────────────────────────────────────
+# Storage: mainnet 専用 DB
+# ───────────────────────────────────────────────
+# testnet の hl_bot.db とは別ファイルで運用
+storage:
+  db_path: "data/hl_bot_mainnet.db"
