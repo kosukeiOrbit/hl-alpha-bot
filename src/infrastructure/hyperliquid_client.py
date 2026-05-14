@@ -1096,15 +1096,35 @@ class HyperLiquidClient:
 
     @staticmethod
     def _grouped_status_to_result(idx: int, status: Any) -> OrderResult:
+        """grouped bulk_orders 個別 status を OrderResult / 例外に変換。
+
+        PR Level 3: idx==0（entry slot）の inner error は単発 place_order と
+        同じく ``_raise_inner_error`` 経由で ``OrderRejectedError`` を raise する。
+        これにより entry_flow の既存 try/except (OrderRejectedError ...) が
+        grouped path でも自動的に効いて logger.exception + send_alert
+        (entry_fail:{symbol}:{direction}) が走る。
+
+        idx>=1（TP/SL slot）の inner error は **raise しない**。entry が
+        statuses[0] で resting/filled として成功している可能性があり、ここで
+        raise すると tuple そのものが失われて呼び出し側で「entry は約定したが
+        TP/SL が未付与」という危険な状態を検知できなくなる。partial success
+        は OrderResult(success=False) で表現し、entry_flow で個別に判定する。
+
+        2026-05-14 mainnet 観察で entry slot の ALO 拒否が silent return
+        されていたことを修正（章9.x で詳述）。
+        """
         if isinstance(status, str):
             return OrderResult(success=True, order_id=None)
         if not isinstance(status, dict):
             raise ExchangeError(f"Unexpected status[{idx}] format: {status!r}")
         if "error" in status:
+            error_msg = str(status["error"])
+            if idx == 0:
+                HyperLiquidClient._raise_inner_error(error_msg)
             return OrderResult(
                 success=False,
                 order_id=None,
-                rejected_reason=str(status["error"]),
+                rejected_reason=error_msg,
             )
         if "resting" in status:
             return OrderResult(

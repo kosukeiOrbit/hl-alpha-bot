@@ -2137,6 +2137,10 @@ class TestPlaceOrdersGrouped:
 
     @pytest.mark.asyncio
     async def test_partial_failure_returns_mixed_results(self) -> None:
+        # PR Level 3: TP/SL (idx>=1) の inner error は raise しない設計を維持。
+        # entry が statuses[0] で resting/filled として成功している partial
+        # success のケース。raise すると tuple が失われて dangling entry の
+        # 重大事故になるため。
         client = _writeable_client()
         assert client._exchange is not None
         client._exchange.bulk_orders = MagicMock(
@@ -2168,6 +2172,113 @@ class TestPlaceOrdersGrouped:
         assert results[1].success is False
         assert "Insufficient margin" in (results[1].rejected_reason or "")
         assert results[2].success is True
+
+    @pytest.mark.asyncio
+    async def test_entry_alo_rejection_raises_order_rejected(self) -> None:
+        """PR Level 3: entry slot (idx=0) の ALO 拒否は OrderRejectedError raise。
+
+        2026-05-14 mainnet 実機検証で実発生メッセージを確認:
+        "Post only order would have immediately matched, bbo was 2267.7@2267.8."
+        単発 place_order と同じく ALO_REJECT code で raise する。
+        """
+        client = _writeable_client()
+        assert client._exchange is not None
+        alo_msg = (
+            "Post only order would have immediately matched, "
+            "bbo was 2267.7@2267.8. asset=1"
+        )
+        client._exchange.bulk_orders = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {
+                        "statuses": [
+                            {"error": alo_msg},
+                            {"resting": {"oid": 101}},
+                            {"resting": {"oid": 102}},
+                        ]
+                    },
+                },
+            }
+        )
+        entry = _make_request(price=Decimal("65000"), size=Decimal("0.0002"))
+        tp = _trigger_request(
+            tpsl="tp",
+            is_market=False,
+            limit_price=Decimal("67100"),
+            trigger_price=Decimal("67000"),
+        )
+        sl = _trigger_request(trigger_price=Decimal("63000"))
+
+        with pytest.raises(OrderRejectedError) as exc_info:
+            await client.place_orders_grouped(entry, tp, sl)
+        assert exc_info.value.code == "ALO_REJECT"
+        assert "Post only order would have immediately matched" in str(
+            exc_info.value
+        )
+
+    @pytest.mark.asyncio
+    async def test_entry_generic_error_raises_order_rejected(self) -> None:
+        """entry slot の generic error も raise（単発と同じ）。"""
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.bulk_orders = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {
+                        "statuses": [
+                            {"error": "Insufficient margin"},
+                            {"resting": {"oid": 101}},
+                            {"resting": {"oid": 102}},
+                        ]
+                    },
+                },
+            }
+        )
+        entry = _make_request(price=Decimal("65000"), size=Decimal("0.0002"))
+        tp = _trigger_request(
+            tpsl="tp",
+            is_market=False,
+            limit_price=Decimal("67100"),
+            trigger_price=Decimal("67000"),
+        )
+        sl = _trigger_request(trigger_price=Decimal("63000"))
+
+        with pytest.raises(OrderRejectedError) as exc_info:
+            await client.place_orders_grouped(entry, tp, sl)
+        # ALO 以外なので code は None
+        assert exc_info.value.code is None
+        assert "Insufficient margin" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_entry_duplicate_raises_duplicate_order(self) -> None:
+        """entry slot の duplicate cloid error は DuplicateOrderError。"""
+        from src.adapters.exchange import DuplicateOrderError
+
+        client = _writeable_client()
+        assert client._exchange is not None
+        client._exchange.bulk_orders = MagicMock(
+            return_value={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {
+                        "statuses": [
+                            {"error": "Order already placed with cloid"},
+                            {"resting": {"oid": 101}},
+                        ]
+                    },
+                },
+            }
+        )
+        entry = _make_request(price=Decimal("65000"), size=Decimal("0.0002"))
+        sl = _trigger_request(trigger_price=Decimal("63000"))
+
+        with pytest.raises(DuplicateOrderError):
+            await client.place_orders_grouped(entry, None, sl)
 
     @pytest.mark.asyncio
     async def test_filled_status_returns_success(self) -> None:
