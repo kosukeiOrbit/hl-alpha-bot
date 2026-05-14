@@ -1072,6 +1072,8 @@ class TestGetAccountBalance:
     async def test_returns_account_value(self) -> None:
         client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
         client._info = MagicMock()
+        # legacy split path をテスト: abstraction を非 unified に固定
+        client._abstraction_state = "splitAccount"
         client._info.user_state = MagicMock(
             return_value={"marginSummary": {"accountValue": "1234.56"}}
         )
@@ -1081,6 +1083,7 @@ class TestGetAccountBalance:
     async def test_returns_zero_when_empty(self) -> None:
         client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
         client._info = MagicMock()
+        client._abstraction_state = "splitAccount"
         client._info.user_state = MagicMock(return_value={})
         assert await client.get_account_balance_usd() == Decimal("0")
 
@@ -1088,9 +1091,180 @@ class TestGetAccountBalance:
     async def test_sdk_error_propagates(self) -> None:
         client = HyperLiquidClient(network="testnet", address=_TEST_ADDR)
         client._info = MagicMock()
+        client._abstraction_state = "splitAccount"
         client._info.user_state = MagicMock(side_effect=Exception("err"))
         with pytest.raises(ExchangeError, match="Failed to fetch account balance"):
             await client.get_account_balance_usd()
+
+
+# ─── PR7.4-fix: unified account 対応 ──────
+
+
+class TestGetAccountBalanceUnifiedAccount:
+    """HL の unifiedAccount モード（cross-margin）での balance 取得。
+
+    spot USDC が perp 担保として使われるため、marginSummary.accountValue では
+    なく spot_user_state を参照する必要がある。
+    """
+
+    @pytest.mark.asyncio
+    async def test_unified_uses_token_to_available_after_maintenance(
+        self,
+    ) -> None:
+        # 最も精確なフィールド: tokenToAvailableAfterMaintenance[USDC=0]
+        client = HyperLiquidClient(network="mainnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._abstraction_state = "unifiedAccount"
+        client._info.spot_user_state = MagicMock(
+            return_value={
+                "balances": [
+                    {"coin": "USDC", "token": 0, "total": "500.0"},
+                ],
+                "tokenToAvailableAfterMaintenance": [[0, "295.0"]],
+            }
+        )
+        # tokenToAvailableAfterMaintenance を優先して 295 を返す（500 ではない）
+        assert await client.get_account_balance_usd() == Decimal("295.0")
+
+    @pytest.mark.asyncio
+    async def test_unified_skips_non_usdc_tokens_in_maintenance_list(
+        self,
+    ) -> None:
+        # tokenToAvailableAfterMaintenance に USDC 以外のトークンが混ざる場合は
+        # スキップして USDC エントリを使う（branch 704->702 のカバレッジ）
+        client = HyperLiquidClient(network="mainnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._abstraction_state = "unifiedAccount"
+        client._info.spot_user_state = MagicMock(
+            return_value={
+                # 1 件目: USDT0（token=268）→ スキップ
+                # 2 件目: USDC（token=0）→ こちらを採用
+                "tokenToAvailableAfterMaintenance": [
+                    [268, "100.0"],
+                    [0, "295.0"],
+                ],
+            }
+        )
+        assert await client.get_account_balance_usd() == Decimal("295.0")
+
+    @pytest.mark.asyncio
+    async def test_unified_falls_back_to_balances_total(self) -> None:
+        # tokenToAvailableAfterMaintenance 無し → balances[USDC].total を使う
+        client = HyperLiquidClient(network="mainnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._abstraction_state = "unifiedAccount"
+        client._info.spot_user_state = MagicMock(
+            return_value={
+                "balances": [
+                    {"coin": "USDC", "token": 0, "total": "295.0"},
+                ],
+            }
+        )
+        assert await client.get_account_balance_usd() == Decimal("295.0")
+
+    @pytest.mark.asyncio
+    async def test_unified_no_usdc_returns_zero(self) -> None:
+        # USDC が balances に無い場合は 0
+        client = HyperLiquidClient(network="mainnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._abstraction_state = "unifiedAccount"
+        client._info.spot_user_state = MagicMock(
+            return_value={
+                "balances": [{"coin": "USDT0", "token": 268, "total": "100.0"}],
+            }
+        )
+        assert await client.get_account_balance_usd() == Decimal("0")
+
+    @pytest.mark.asyncio
+    async def test_unified_empty_response_returns_zero(self) -> None:
+        client = HyperLiquidClient(network="mainnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._abstraction_state = "unifiedAccount"
+        client._info.spot_user_state = MagicMock(return_value={})
+        assert await client.get_account_balance_usd() == Decimal("0")
+
+    @pytest.mark.asyncio
+    async def test_unified_spot_fetch_error_raises(self) -> None:
+        client = HyperLiquidClient(network="mainnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._abstraction_state = "unifiedAccount"
+        client._info.spot_user_state = MagicMock(
+            side_effect=Exception("api down")
+        )
+        with pytest.raises(
+            ExchangeError, match="Failed to fetch spot state"
+        ):
+            await client.get_account_balance_usd()
+
+    @pytest.mark.asyncio
+    async def test_abstraction_state_detected_and_cached_unified(self) -> None:
+        # 初回 get_account_balance_usd で query_user_abstraction_state を呼ぶ
+        # 2 回目以降は呼ばない（インスタンスキャッシュ）
+        client = HyperLiquidClient(network="mainnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.query_user_abstraction_state = MagicMock(
+            return_value="unifiedAccount"
+        )
+        client._info.spot_user_state = MagicMock(
+            return_value={"tokenToAvailableAfterMaintenance": [[0, "100.0"]]}
+        )
+        await client.get_account_balance_usd()
+        await client.get_account_balance_usd()
+        # 抽象状態クエリは 1 回だけ
+        assert client._info.query_user_abstraction_state.call_count == 1
+        # 一方 spot_user_state は毎回呼ばれる（balance は変化するため）
+        assert client._info.spot_user_state.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_abstraction_state_detected_and_cached_split(self) -> None:
+        # split account として検出された場合のキャッシュ動作
+        client = HyperLiquidClient(network="mainnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.query_user_abstraction_state = MagicMock(
+            return_value="splitAccount"
+        )
+        client._info.user_state = MagicMock(
+            return_value={"marginSummary": {"accountValue": "500.0"}}
+        )
+        assert await client.get_account_balance_usd() == Decimal("500.0")
+        await client.get_account_balance_usd()
+        assert client._info.query_user_abstraction_state.call_count == 1
+        # spot は呼ばれない（split path）
+        assert (
+            not client._info.spot_user_state.called
+            if hasattr(client._info.spot_user_state, "called")
+            else True
+        )
+
+    @pytest.mark.asyncio
+    async def test_abstraction_query_failure_assumes_split(self) -> None:
+        # query_user_abstraction_state が失敗 → 安全側 split として扱う
+        client = HyperLiquidClient(network="mainnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.query_user_abstraction_state = MagicMock(
+            side_effect=Exception("network down")
+        )
+        client._info.user_state = MagicMock(
+            return_value={"marginSummary": {"accountValue": "42.0"}}
+        )
+        # 例外を上げずに split path にフォールバックして 42 を返す
+        assert await client.get_account_balance_usd() == Decimal("42.0")
+        # 後続呼び出しでも再クエリしない（"splitAccount" がキャッシュされた）
+        assert client._abstraction_state == "splitAccount"
+
+    @pytest.mark.asyncio
+    async def test_abstraction_returns_none_assumes_split(self) -> None:
+        # query_user_abstraction_state が None を返した場合も split 扱い
+        client = HyperLiquidClient(network="mainnet", address=_TEST_ADDR)
+        client._info = MagicMock()
+        client._info.query_user_abstraction_state = MagicMock(
+            return_value=None
+        )
+        client._info.user_state = MagicMock(
+            return_value={"marginSummary": {"accountValue": "10.0"}}
+        )
+        assert await client.get_account_balance_usd() == Decimal("10.0")
+        assert client._abstraction_state == "splitAccount"
 
 
 class TestGetOrderStatus:

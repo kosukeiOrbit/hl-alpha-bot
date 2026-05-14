@@ -88,6 +88,10 @@ class HyperLiquidClient:
         self._info: Info | None = None
         self._exchange: Exchange | None = None
         self._symbols_cache: tuple[SymbolMeta, ...] | None = None
+        # PR7.4-fix: unified account（cross-margin）か legacy split かを
+        # 初回 get_account_balance_usd 時に検出してキャッシュ。
+        # アカウント設定は BOT 稼働中に変わらないので一度で十分。
+        self._abstraction_state: str | None = None
 
     @property
     def info(self) -> Info:
@@ -633,8 +637,79 @@ class HyperLiquidClient:
         return tuple(payments)
 
     async def get_account_balance_usd(self) -> Decimal:
-        """口座残高（USDC・章22.7 marginSummary.accountValue）。"""
+        """口座残高 USDC（章22.7）。
+
+        HL のアカウント抽象状態（`query_user_abstraction_state`）に応じて
+        参照先を切り替える:
+
+        - **unifiedAccount**: spot USDC が perp 担保として使われる cross-margin
+          モード。``marginSummary.accountValue`` は perp 直接保有のみで spot 分が
+          反映されないため、``spot_user_state`` から USDC 残高を読む。
+        - **それ以外（legacy split margin）**: 従来通り
+          ``marginSummary.accountValue``。
+
+        2026-05-13 mainnet 観察で「spot=$295 / perp=$0 で BOT が balance=$0 と
+        見る」事象が発生し、`query_user_abstraction_state == "unifiedAccount"`
+        と判明（章9.x で詳述）。
+
+        抽象状態の判定は初回呼び出し時のみ。アカウント設定は BOT 稼働中に
+        変わらないので結果をインスタンスにキャッシュする。
+        """
         self._require_address()
+        if self._abstraction_state is None:
+            self._abstraction_state = await self._fetch_abstraction_state()
+        if self._abstraction_state == "unifiedAccount":
+            return await self._get_unified_balance_usd()
+        return await self._get_split_balance_usd()
+
+    async def _fetch_abstraction_state(self) -> str:
+        """``query_user_abstraction_state`` 結果を文字列で返す。
+
+        取得失敗時は安全側として ``"splitAccount"``（legacy）扱いに倒す。
+        ここで unified を誤判定すると spot 残高ベースで size 計算してしまい、
+        split account ユーザーで実発注時に margin 不足拒否を踏むため。
+        """
+        try:
+            result = await asyncio.to_thread(
+                self.info.query_user_abstraction_state, self.address
+            )
+        except Exception as e:
+            logger.warning(
+                "query_user_abstraction_state failed: %s, "
+                "assuming splitAccount (legacy)",
+                e,
+            )
+            return "splitAccount"
+        state = str(result) if result is not None else "splitAccount"
+        logger.info("HL account abstraction state: %s", state)
+        return state
+
+    async def _get_unified_balance_usd(self) -> Decimal:
+        """unified account: spot USDC を perp 担保として読む。
+
+        ``tokenToAvailableAfterMaintenance`` がメンテナンス margin 控除後の
+        実利用可能額。これが最も精確。
+        無ければ ``balances`` 配列の USDC.total にフォールバック。
+        """
+        try:
+            spot = await asyncio.to_thread(
+                self.info.spot_user_state, self.address
+            )
+        except Exception as e:
+            raise ExchangeError(
+                f"Failed to fetch spot state for balance: {e}"
+            ) from e
+        for entry in spot.get("tokenToAvailableAfterMaintenance", []):
+            # entry の形式: [token_id, "amount"]。USDC は token_id=0。
+            if len(entry) >= 2 and int(entry[0]) == 0:
+                return Decimal(str(entry[1]))
+        for b in spot.get("balances", []):
+            if b.get("coin") == "USDC":
+                return Decimal(str(b.get("total", "0")))
+        return Decimal("0")
+
+    async def _get_split_balance_usd(self) -> Decimal:
+        """legacy split margin: 従来通り marginSummary.accountValue。"""
         try:
             response = await asyncio.to_thread(self.info.user_state, self.address)
         except Exception as e:
