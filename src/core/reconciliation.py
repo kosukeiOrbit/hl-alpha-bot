@@ -35,13 +35,20 @@ class HLPosition:
 
 @dataclass(frozen=True)
 class DBTrade:
-    """DB側の取引記録（突合用最小データ）。"""
+    """DB側の取引記録（突合用最小データ）。
+
+    PR A3 (#3 of 5 mainnet first-trades bugs): ``entry_time_ms`` を追加。
+    ``_find_matching_fill`` で ``fill.timestamp >= entry_time_ms`` を強制し、
+    エントリー前の古い fill が誤マッチする事故（2026-05-15 ID 1 の TP fill が
+    ID 2-7 に伝播）を防ぐ。
+    """
 
     trade_id: int
     symbol: str
     direction: str  # 'LONG' or 'SHORT'
     size: Decimal
     entry_price: Decimal
+    entry_time_ms: int
 
 
 @dataclass(frozen=True)
@@ -183,14 +190,32 @@ def _find_matching_fill(
 ) -> HLFill | None:
     """DB取引に対応する決済 fill を探す（純関数）。
 
-    決済 fill の条件: シンボル一致 / DBの direction と逆方向 side
-    （LONG決済 → sell, SHORT決済 → buy）/ サイズが概ね一致。
+    決済 fill の条件:
+    - シンボル一致
+    - DB の direction と逆方向 side（LONG決済 → sell, SHORT決済 → buy）
+    - サイズが概ね一致（tolerance 0.0001）
+    - **fill.timestamp >= db_trade.entry_time_ms**（PR A3 #3）
+
+    最後の条件が無いと、エントリー前に発生した過去の決済 fill が
+    （symbol/side/size が偶然一致するだけで）誤マッチして DB を上書きする。
+    2026-05-15 mainnet で ID 1 の TP fill が ID 2-7 にすべてマッチした
+    実例を再現したテストを ``tests/core/test_reconciliation.py`` に追加。
+
+    上限（max_age）は意図的に設けていない。理由:
+    - is_filled=1 フィルタ（``StateReconciler._run_core_reconcile``）で
+      reconciler が見る trade は実約定済みに限定される
+    - PR A1 の max_position_count=1 ゲートにより同時刻に同 symbol/side/
+      size の trade が複数 open することは構造的に発生しない
+    - 上限を設けると低ボラ局面での長保有 trade の正規 fill を
+      取りこぼし、誤って MANUAL_REVIEW に流れる
     """
     expected_side = "sell" if db_trade.direction == "LONG" else "buy"
     for fill in hl_fills:
         if fill.symbol != db_trade.symbol:
             continue
         if fill.side != expected_side:
+            continue
+        if fill.timestamp < db_trade.entry_time_ms:
             continue
         if abs(fill.size - abs(db_trade.size)) <= Decimal("0.0001"):
             return fill

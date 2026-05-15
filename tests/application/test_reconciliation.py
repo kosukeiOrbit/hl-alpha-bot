@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -452,6 +453,7 @@ class TestApplyActionDispatch:
                 direction="LONG",
                 size=Decimal("0.0002"),
                 entry_price=Decimal("65000"),
+                entry_time_ms=1_000_000_000_000,
             ),
         )
         # type を unknown 文字列に差し替え
@@ -486,6 +488,7 @@ class TestApplyActionDispatch:
                 direction="LONG",
                 size=Decimal("0.0002"),
                 entry_price=Decimal("65000"),
+                entry_time_ms=1_000_000_000_000,
             ),
             fill=hl_fill,
         )
@@ -597,3 +600,99 @@ class TestSummaryShape:
         )
         with pytest.raises(FrozenInstanceError):
             summary.actions_executed = 1  # type: ignore[misc]
+
+
+# ─── PR A3 (#3): is_filled=1 でフィルタ ─────
+
+
+class TestIsFilledFilter:
+    """``_run_core_reconcile`` が ``is_filled=0`` の trade を除外することの確認
+    （PR A3 #3）。
+
+    2026-05-15 mainnet で resting 中の ALO 注文（is_filled=0）が reconciler の
+    対象になり、ID 1 の TP fill と誤マッチして DB が壊れた事例の構造的修正。
+    """
+
+    @pytest.mark.asyncio
+    async def test_unfilled_trade_excluded_from_close_from_fill(self) -> None:
+        # ALO で resting 中（is_filled=False）の trade は CLOSE_FROM_FILL に
+        # 流れない。HL に同 symbol/side/size の決済 fill があっても無視。
+        resting = make_trade(is_filled=False)
+        sell_fill = make_fill(
+            symbol="BTC",
+            side="sell",  # LONG 決済（resting 側 direction=LONG）
+            size=resting.size_coins,
+            price=Decimal("66000"),
+            closed_pnl=Decimal("2"),
+        )
+        reconciler, _, repo, _ = build_reconciler(
+            positions=(),
+            open_trades=(resting,),
+            fills=(sell_fill,),
+        )
+        summary = await reconciler.restore_on_startup()
+        # CLOSE_FROM_FILL も MANUAL_REVIEW も発火しない
+        # （reconciler が resting を見ない設計）
+        repo.close_trade_from_fill.assert_not_awaited()
+        repo.mark_manual_review.assert_not_awaited()
+        # summary も 0
+        assert summary.actions_executed == 0
+
+    @pytest.mark.asyncio
+    async def test_filled_trade_still_processed_normally(self) -> None:
+        # is_filled=True なら従来通り処理される
+        filled = make_trade(is_filled=True)
+        sell_fill = make_fill(
+            symbol="BTC",
+            side="sell",
+            size=filled.size_coins,
+            price=Decimal("66000"),
+            closed_pnl=Decimal("2"),
+            timestamp_ms=int(filled.entry_time.timestamp() * 1000) + 60_000,
+        )
+        reconciler, _, repo, _ = build_reconciler(
+            positions=(),
+            open_trades=(filled,),
+            fills=(sell_fill,),
+        )
+        await reconciler.restore_on_startup()
+        # 約定済み trade なので CLOSE_FROM_FILL で正常クローズ
+        repo.close_trade_from_fill.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_mixed_filled_and_unfilled_only_filled_reconciled(
+        self,
+    ) -> None:
+        # 同 symbol/side/size の filled と unfilled が両方ある状態:
+        # 旧コードでは fill が unfilled 側にもマッチして DB が壊れる
+        # 新コードでは unfilled は無視・filled だけが正規に CLOSE される
+        filled = make_trade(
+            is_filled=True,
+            entry_time=datetime.now(UTC) - timedelta(minutes=10),
+        )
+        unfilled = make_trade(
+            is_filled=False,
+            entry_time=datetime.now(UTC) - timedelta(minutes=5),
+        )
+        # filled の entry より後の fill を 1 件
+        fill = make_fill(
+            symbol="BTC", side="sell",
+            size=filled.size_coins, price=Decimal("66000"),
+            closed_pnl=Decimal("2"),
+            timestamp_ms=int(
+                (datetime.now(UTC) - timedelta(minutes=1)).timestamp() * 1000
+            ),
+        )
+        # ※両方とも id=1 だと collision するので unfilled は別 id
+        unfilled = replace(unfilled, id=2)
+        reconciler, _, repo, _ = build_reconciler(
+            positions=(),
+            open_trades=(filled, unfilled),
+            fills=(fill,),
+        )
+        await reconciler.restore_on_startup()
+        # CLOSE_FROM_FILL は1回だけ（filled のみ）
+        assert repo.close_trade_from_fill.await_count == 1
+        # その引数は filled の trade_id=1
+        call = repo.close_trade_from_fill.await_args
+        assert call.kwargs.get("trade_id") == filled.id or call.args[0] == filled.id

@@ -189,11 +189,25 @@ class StateReconciler:
         hl_fills: tuple[Fill, ...],
         errors: list[str],
     ) -> ReconcileResult:
-        """ADAPTERS 型 → CORE 型に変換して reconcile_positions を呼ぶ。"""
+        """ADAPTERS 型 → CORE 型に変換して reconcile_positions を呼ぶ。
+
+        PR A3 (#3 of 5): ``is_filled=0`` の trade（ALO 等で resting 中の
+        未約定エントリー）は reconciliation の対象から除外する。
+        これらは「約定すれば position_monitor が拾う」「約定しなければ
+        資金は動いていない」状態であり、reconciler が "HL に position が
+        無い" として CLOSE_FROM_FILL に流すと、関係ない過去 fill との
+        誤マッチで DB が壊れる（2026-05-15 mainnet で ID 2-4 が ID 1 の
+        TP fill で MANUAL クローズされた事例）。
+
+        この絞り込みは entry order が長時間 resting し続けた場合の
+        MANUAL_REVIEW 機会を失うが、その状態の検知は別経路
+        （stale order cleanup, manual ops）で対応する想定。
+        """
+        filled_db_trades = tuple(t for t in db_trades if t.is_filled)
         try:
             return reconcile_positions(
                 hl_positions=tuple(_to_hl_position(p) for p in hl_positions),
-                db_trades=tuple(_to_db_trade(t) for t in db_trades),
+                db_trades=tuple(_to_db_trade(t) for t in filled_db_trades),
                 hl_fills=tuple(_to_hl_fill(f) for f in hl_fills),
             )
         except Exception as e:
@@ -400,6 +414,7 @@ def _to_db_trade(t: Trade) -> DBTrade:
         direction=t.direction,
         size=t.size_coins,
         entry_price=t.entry_price,
+        entry_time_ms=int(t.entry_time.timestamp() * 1000),
     )
 
 

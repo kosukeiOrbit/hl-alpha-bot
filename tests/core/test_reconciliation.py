@@ -34,6 +34,7 @@ def make_db_trade(
     direction: str = "LONG",
     size: str = "0.01",
     entry_price: str = "65000",
+    entry_time_ms: int = 1_000_000_000_000,  # 2001-09-09 — fill timestamps are larger
 ) -> DBTrade:
     return DBTrade(
         trade_id=trade_id,
@@ -41,6 +42,7 @@ def make_db_trade(
         direction=direction,
         size=Decimal(size),
         entry_price=Decimal(entry_price),
+        entry_time_ms=entry_time_ms,
     )
 
 
@@ -231,3 +233,103 @@ class TestPropertyBased:
         )
         result = reconcile_positions(hls, dbs, ())
         assert len(result.actions) == n_only_hl + n_only_db
+
+
+# ─── PR A3 (#3): timestamp lower-bound on fill match ─
+
+
+class TestFillTimestampLowerBound:
+    """``_find_matching_fill`` の timestamp 制約（PR A3 #3）。
+
+    2026-05-15 mainnet で ID 1 の TP fill（14:36）が ID 2-7（14:43 以降に
+    entry）に伝播した実バグの再現テストを含む。
+    """
+
+    def test_fill_before_entry_time_not_matched(self) -> None:
+        # entry_time が fill より後 → マッチしない
+        db_trade = make_db_trade(
+            direction="SHORT", size="0.01", entry_time_ms=2_000_000_000_000
+        )
+        # 古い buy fill（entry より前）
+        old_fill = make_fill(
+            symbol="BTC", side="buy", size="0.01",
+            timestamp=1_000_000_000_000,
+        )
+        result = reconcile_positions((), (db_trade,), (old_fill,))
+        # MANUAL_REVIEW になる（CLOSE_FROM_FILL ではない）
+        actions = result.actions
+        assert len(actions) == 1
+        assert actions[0].type == ActionType.MANUAL_REVIEW
+
+    def test_fill_at_or_after_entry_time_matches(self) -> None:
+        # entry_time と同時刻 or 以降 → マッチする
+        entry_ms = 1_500_000_000_000
+        db_trade = make_db_trade(
+            direction="SHORT", size="0.01", entry_time_ms=entry_ms
+        )
+        # entry と同時刻の buy fill
+        fill_at_entry = make_fill(
+            symbol="BTC", side="buy", size="0.01", timestamp=entry_ms,
+        )
+        result = reconcile_positions((), (db_trade,), (fill_at_entry,))
+        actions = result.actions
+        assert len(actions) == 1
+        assert actions[0].type == ActionType.CLOSE_FROM_FILL
+
+    def test_mainnet_2026_05_15_id1_tp_does_not_contaminate_id2(self) -> None:
+        """2026-05-15 mainnet 実バグの再現:
+
+        ID 1 SHORT entry 05:35:58 → ID 1 TP fill (buy) 05:36:10
+        ID 2 SHORT entry 05:43:28（ID 1 と同 symbol/side/size）
+        旧コードでは ID 1 の TP fill が ID 2 にもマッチし、reconciler が
+        ID 2 を MANUAL クローズしていた（exit_price も ID 1 の値で上書き）。
+        本テストは ID 2 が MANUAL_REVIEW に流れる（誤クローズしない）こと
+        を保証する。
+        """
+        id1_tp_fill_ms = 1715750170000  # 2026-05-15 05:36:10 UTC 相当
+        id2_entry_ms = 1715750608000   # 2026-05-15 05:43:28 UTC 相当
+        # ID 2: SHORT, entry 14:43:28, size 0.00021
+        id2 = make_db_trade(
+            trade_id=2,
+            symbol="BTC",
+            direction="SHORT",
+            size="0.00021",
+            entry_price="80462",
+            entry_time_ms=id2_entry_ms,
+        )
+        # ID 1 の TP fill（buy）: 06:36 UTC、size 0.00022（許容内）
+        id1_tp = make_fill(
+            symbol="BTC", side="buy", size="0.00022",
+            price="80414", timestamp=id1_tp_fill_ms,
+        )
+        result = reconcile_positions((), (id2,), (id1_tp,))
+        # ID 2 は CLOSE_FROM_FILL に流れない
+        assert all(
+            a.type != ActionType.CLOSE_FROM_FILL for a in result.actions
+        )
+        # 代わりに MANUAL_REVIEW
+        assert any(
+            a.type == ActionType.MANUAL_REVIEW for a in result.actions
+        )
+
+    def test_correct_fill_after_old_fill_still_matches(self) -> None:
+        # 古い無関係 fill と、正しい新しい fill が両方ある場合、新しい方がマッチ
+        entry_ms = 1_500_000_000_000
+        db_trade = make_db_trade(
+            direction="SHORT", size="0.01", entry_time_ms=entry_ms
+        )
+        old_fill = make_fill(
+            symbol="BTC", side="buy", size="0.01",
+            price="60000", timestamp=entry_ms - 100_000,
+        )
+        new_fill = make_fill(
+            symbol="BTC", side="buy", size="0.01",
+            price="66000", timestamp=entry_ms + 100_000,
+        )
+        result = reconcile_positions((), (db_trade,), (old_fill, new_fill))
+        actions = result.actions
+        assert len(actions) == 1
+        assert actions[0].type == ActionType.CLOSE_FROM_FILL
+        # 古い fill にマッチしない（その fill の price 60000 ではなく 66000）
+        assert actions[0].fill is not None
+        assert actions[0].fill.price == Decimal("66000")
