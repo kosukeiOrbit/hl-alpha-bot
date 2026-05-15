@@ -621,6 +621,7 @@ def _row_to_trade(row: aiosqlite.Row) -> Trade:
             if row["sl_order_id"] is not None
             else None
         ),
+        fill_time=_iso_to_dt(row["fill_time"]),
     )
 
 

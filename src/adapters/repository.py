@@ -54,6 +54,7 @@ class Trade:
     actual_entry_price: Decimal | None = None
     tp_order_id: int | None = None
     sl_order_id: int | None = None
+    fill_time: datetime | None = None
 
 
 @dataclass(frozen=True)

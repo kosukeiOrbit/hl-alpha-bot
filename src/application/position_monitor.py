@@ -113,7 +113,23 @@ class PositionMonitor:
     # ─── 約定検知 ───────────────────────────────
 
     async def _detect_fills(self) -> tuple[int, int]:
-        """直近の fills を取得して entry / 決済をマッチング。"""
+        """直近の fills を取得して entry / 決済をマッチング。
+
+        PR B1 (#5 of 5 mainnet first-trades bugs): 同一 HL fill が複数 cycle で
+        再処理され、別の trade（同 size の隣接 ALO 等）に誤って属性化される
+        事故を防ぐため、DB に既に ``fill_time`` が記録されている entry fill
+        の timestamp を集めて重複検出する。
+
+        2026-05-15 mainnet で ID 6 の entry fill (05:51:15.526) が次 cycle 以降
+        で再取得され、is_filled=0 だった ID 7 を誤って ``is_filled=1`` に
+        マークした（``actual_entry_price`` まで ID 6 の値で上書き）。
+        DB ベースの dedup なので BOT 再起動にも強い（再起動直後の最初の
+        cycle で trades テーブルから前回までの fill_time が復元される）。
+
+        max_position_count=1（PR A1）のもとでは同時に open trade が 1 件
+        しか存在しないので、同 timestamp で別 trade に正規割り当てされる
+        ことは構造的に発生しない。よって timestamp 単独 dedup で十分。
+        """
         since_ms = int(
             (
                 datetime.now(UTC)
@@ -124,12 +140,31 @@ class PositionMonitor:
         fills = await self.exchange.get_fills(since_ms=since_ms)
         open_trades = await self.repo.get_open_trades()
 
+        # DB に既に処理済みとして記録されている entry fill の timestamp を集める。
+        # close fill は trade が exit_time を設定された時点で open_trades から
+        # 外れるので、自然と _dispatch_fill の close 経路が "ignored" になる
+        # ため、dedup 対象は entry 側のみで十分。
+        recent_trades = await self.repo.get_recent_trades(limit=100)
+        processed_entry_fill_ms: set[int] = {
+            int(t.fill_time.timestamp() * 1000)
+            for t in recent_trades
+            if t.fill_time is not None
+        }
+
         entry_filled = 0
         closed = 0
         for fill in fills:
+            if fill.timestamp_ms in processed_entry_fill_ms:
+                # 既に entry fill として処理済み。同 timestamp の close fill が
+                # 万一来ても skip するが、これは現実的に発生しない（entry と
+                # close は別オーダーで HL の timestamp_ms は 1ms 単位で異なる）。
+                continue
             handled = await self._dispatch_fill(fill, open_trades)
             if handled == "entry":
                 entry_filled += 1
+                # 同 cycle 内で同 timestamp が複数 fills に出ることはまず無いが、
+                # 念のため処理済みに加える（同 cycle 内 dedup）。
+                processed_entry_fill_ms.add(fill.timestamp_ms)
             elif handled == "close":
                 closed += 1
         return entry_filled, closed

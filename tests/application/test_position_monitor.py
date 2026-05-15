@@ -62,6 +62,7 @@ def make_trade(**overrides: Any) -> Trade:
         "actual_entry_price": None,
         "tp_order_id": None,
         "sl_order_id": None,
+        "fill_time": None,
     }
     base.update(overrides)
     return Trade(**base)
@@ -123,6 +124,7 @@ def build_monitor(
     *,
     fills: tuple[Fill, ...] = (),
     open_trades: tuple[Trade, ...] = (),
+    recent_trades: tuple[Trade, ...] = (),
     positions: tuple[Position, ...] = (),
     open_orders: tuple[Order, ...] = (),
     book: L2Book | None = None,
@@ -159,6 +161,7 @@ def build_monitor(
 
     repo = AsyncMock()
     repo.get_open_trades = AsyncMock(return_value=open_trades)
+    repo.get_recent_trades = AsyncMock(return_value=recent_trades)
     repo.mark_trade_filled = AsyncMock()
     repo.update_tp_sl_order_ids = AsyncMock()
     repo.update_mfe_mae = AsyncMock()
@@ -241,6 +244,81 @@ class TestEntryFilledDetection:
         )
         result = await monitor.run_cycle()
         assert result.trades_filled == 0
+
+
+# ─── PR B1 (#5): fill 冪等化（DB fill_time ベース dedup） ─
+
+
+class TestFillIdempotency:
+    """``_detect_fills`` の DB 由来 fill_time dedup（PR B1 #5）。
+
+    2026-05-15 mainnet で ID 6 の entry fill (05:51:15.526) が次 cycle 以降の
+    fills_lookback 内に残り続け、is_filled=0 だった ID 7 (同 size の隣接 ALO)
+    を誤って ``is_filled=1`` にマークした（``actual_entry_price`` まで上書き）。
+    本テスト群は: ① 既処理 timestamp は skip、② 未処理は正常に entry 反映、
+    ③ 直近 trade 一覧の自動取得、を保証する。
+    """
+
+    @pytest.mark.asyncio
+    async def test_fill_with_known_timestamp_is_skipped(self) -> None:
+        ts = 1_715_750_175_526  # 2026-05-15 05:51:15.526 UTC 相当
+        already_processed = make_trade(
+            id=6,
+            is_filled=True,
+            fill_time=datetime.fromtimestamp(ts / 1000, tz=UTC),
+        )
+        pending = make_trade(id=7, is_filled=False)
+        replay_fill = make_fill(timestamp_ms=ts)
+        monitor, _, repo, _ = build_monitor(
+            fills=(replay_fill,),
+            open_trades=(pending,),
+            recent_trades=(already_processed, pending),
+        )
+        result = await monitor.run_cycle()
+        # ID 7 は誤って filled にならない
+        assert result.trades_filled == 0
+        repo.mark_trade_filled.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fill_with_new_timestamp_still_processed(self) -> None:
+        old_ts = 1_715_750_175_526
+        old_trade = make_trade(
+            id=6,
+            is_filled=True,
+            fill_time=datetime.fromtimestamp(old_ts / 1000, tz=UTC),
+        )
+        pending = make_trade(id=7, is_filled=False)
+        # 新しい timestamp（dedup set に入らない）の本物 entry fill
+        fresh_fill = make_fill(timestamp_ms=old_ts + 60_000)
+        monitor, _, repo, _ = build_monitor(
+            fills=(fresh_fill,),
+            open_trades=(pending,),
+            recent_trades=(old_trade, pending),
+        )
+        result = await monitor.run_cycle()
+        assert result.trades_filled == 1
+        repo.mark_trade_filled.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_recent_trades_without_fill_time_do_not_block(self) -> None:
+        # fill_time が None の旧レコードは dedup set に含まれない（影響なし）
+        legacy = make_trade(id=5, is_filled=False, fill_time=None)
+        pending = make_trade(id=7, is_filled=False)
+        fill = make_fill()
+        monitor, _, repo, _ = build_monitor(
+            fills=(fill,),
+            open_trades=(pending,),
+            recent_trades=(legacy, pending),
+        )
+        result = await monitor.run_cycle()
+        assert result.trades_filled == 1
+        repo.mark_trade_filled.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_get_recent_trades_called_each_cycle(self) -> None:
+        monitor, _, repo, _ = build_monitor()
+        await monitor.run_cycle()
+        repo.get_recent_trades.assert_awaited_once_with(limit=100)
 
 
 # ─── TP/SL order_id 紐付け ────────────────
