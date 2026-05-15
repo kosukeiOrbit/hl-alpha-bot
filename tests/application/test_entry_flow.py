@@ -725,6 +725,150 @@ class TestJudgmentFailure:
         assert flow_log.rejection_reason is None
 
 
+# ─── PR A2 (#1): ATR サイジング ────────────────────
+
+
+def _sizing_candle(
+    *,
+    open_: float,
+    high: float,
+    low: float,
+    close: float,
+    ts: int = 0,
+) -> Candle:
+    """1h サイジング ATR テスト用 Candle ファクトリ。"""
+    return Candle(
+        symbol="ETH",
+        interval="1h",
+        timestamp_ms=ts,
+        open=Decimal(str(open_)),
+        high=Decimal(str(high)),
+        low=Decimal(str(low)),
+        close=Decimal(str(close)),
+        volume=Decimal("1"),
+    )
+
+
+class TestCalcAtrForSizing:
+    """SL/TP サイジング用 ATR 計算（PR A2 #1）。
+
+    旧 _estimate_atr の ``max(atr, 0.0001)`` floor を撤去し、
+    candle ベース ATR(1h, 14) を使う。candle 取得失敗時は 24h レンジに
+    フォールバック、それでも 0 なら ExchangeError で entry を止める。
+    """
+
+    @pytest.mark.asyncio
+    async def test_uses_real_atr_from_1h_candles(self) -> None:
+        # 16 本: 全 candle で high-low=20 → ATR=20 になるはず
+        candles = tuple(
+            _sizing_candle(open_=100, high=110, low=90, close=100, ts=i)
+            for i in range(16)
+        )
+        flow, _, _, _, _ = build_flow(btc_candles=candles)
+        snap = make_passing_long_snapshot()
+        atr = await flow._calc_atr_for_sizing(snap)
+        assert atr == Decimal("20")
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_24h_when_candles_fetch_error(self) -> None:
+        flow, _, _, _, _ = build_flow(
+            candles_side_effect=ExchangeError("api down"),
+            eth_snapshot=make_passing_long_snapshot(
+                high_24h=3050.0, low_24h=2810.0  # range 240 / 24 = 10
+            ),
+        )
+        snap = make_passing_long_snapshot(high_24h=3050.0, low_24h=2810.0)
+        atr = await flow._calc_atr_for_sizing(snap)
+        assert atr == Decimal("240") / Decimal("24")  # = 10
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_24h_when_insufficient_candles(self) -> None:
+        # period=14 では 15 本必要。10 本だと不足。
+        candles = tuple(
+            _sizing_candle(open_=100, high=110, low=90, close=100, ts=i)
+            for i in range(10)
+        )
+        flow, _, _, _, _ = build_flow(btc_candles=candles)
+        snap = make_passing_long_snapshot(high_24h=3000.0, low_24h=2760.0)
+        atr = await flow._calc_atr_for_sizing(snap)
+        # 24h fallback: (3000-2760)/24 = 10
+        assert atr == Decimal("240") / Decimal("24")
+
+    @pytest.mark.asyncio
+    async def test_raises_when_both_unavailable(self) -> None:
+        # candle 取得失敗 + 24h range = 0（dayHigh=dayLow=current_price 状況の再現）
+        flow, _, _, _, _ = build_flow(
+            candles_side_effect=ExchangeError("api down"),
+        )
+        snap = make_passing_long_snapshot(
+            high_24h=80000.0, low_24h=80000.0  # range=0、本番バグの再現
+        )
+        with pytest.raises(ExchangeError, match="ATR sizing unavailable"):
+            await flow._calc_atr_for_sizing(snap)
+
+    @pytest.mark.asyncio
+    async def test_raises_when_candles_empty_and_range_zero(self) -> None:
+        # candles=() (BTC=ETH 同条件) + range=0 → 同じく raise
+        flow, _, _, _, _ = build_flow()  # 既定 candles=()
+        snap = make_passing_long_snapshot(
+            high_24h=80000.0, low_24h=80000.0
+        )
+        with pytest.raises(ExchangeError, match="ATR sizing unavailable"):
+            await flow._calc_atr_for_sizing(snap)
+
+    @pytest.mark.asyncio
+    async def test_no_more_min_atr_floor(self) -> None:
+        """旧 ``max(atr, 0.0001)`` floor が撤去されていることを確認。
+
+        極小 ATR でも実値がそのまま返る。stop_loss 側の min-1-tick 保証句が
+        防御層として残るが、本層では floor しない。
+        """
+        # 16 本の極小レンジ candle（high-low=0.002）
+        candles = tuple(
+            _sizing_candle(
+                open_=100, high=100.001, low=99.999, close=100, ts=i
+            )
+            for i in range(16)
+        )
+        flow, _, _, _, _ = build_flow(btc_candles=candles)
+        snap = make_passing_long_snapshot()
+        atr = await flow._calc_atr_for_sizing(snap)
+        # 0.002 (実値)。旧実装なら 0.0001 floor で 0.002 のまま（floor 以上なので）
+        # 重要: 値がもっと小さくても 0.0001 にクランプされないこと
+        assert atr == Decimal("0.002")
+
+    @pytest.mark.asyncio
+    async def test_execute_entry_raises_when_atr_unavailable(self) -> None:
+        """ATR 計算不能で _execute_entry が ExchangeError catch 経路に流れること。
+
+        entry_flow の既存 except (OrderRejectedError ...| ExchangeError) で
+        捕捉されて ``entry_fail:{symbol}:{direction}`` alert が発火する。
+        rejected_reason に ATR 由来の文字列が入って trades は作られない。
+        """
+        flow, _, _, repo, notifier = build_flow(
+            candles_side_effect=ExchangeError("api down"),
+            eth_snapshot=make_passing_long_snapshot(
+                high_24h=2500.0, low_24h=2500.0  # range=0 を強制
+            ),
+        )
+        attempt = await flow.evaluate_and_enter("ETH", "LONG")
+        assert attempt.executed is False
+        assert "ATR sizing unavailable" in (attempt.rejected_reason or "")
+        # trades は作らない（_execute_entry の try-except で吸収される前に raise）
+        repo.open_trade.assert_not_awaited()
+        # entry_fail alert が発火
+        fail_call = next(
+            (
+                c
+                for c in notifier.send_alert.await_args_list
+                if "entry failed" in c.args[0]
+            ),
+            None,
+        )
+        assert fail_call is not None
+        assert fail_call.kwargs["dedup_key"] == "entry_fail:ETH:LONG"
+
+
 # ─── EntryAttempt ─────────────────────────────────
 
 

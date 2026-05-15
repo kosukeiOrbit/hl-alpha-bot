@@ -40,7 +40,7 @@ from src.adapters.notifier import Notifier
 from src.adapters.repository import Repository, SignalLog, TradeOpenRequest
 from src.adapters.sentiment import SentimentProvider
 from src.core.entry_judge import judge_long_entry, judge_short_entry
-from src.core.indicators import calculate_atr_pct, calculate_ema
+from src.core.indicators import calculate_atr, calculate_atr_pct, calculate_ema
 from src.core.models import EntryDecision, MarketSnapshot
 from src.core.position_sizer import SizingInput, calculate_position_size
 from src.core.stop_loss import StopLossInput, calculate_sl_tp
@@ -52,6 +52,11 @@ _BTC_EMA_SHORT_PERIOD = 20
 _BTC_EMA_LONG_PERIOD = 50
 _BTC_ATR_LIMIT = 30  # ATR(14) は 15 本以上必要、マージン込み
 _BTC_ATR_PERIOD = 14
+
+# SL/TP サイジング用 ATR 設定（章13.3 ATR(1h, 14)）
+_SIZING_ATR_INTERVAL = "1h"
+_SIZING_ATR_LIMIT = 20  # ATR(14) は 15 本以上必要、マージン込み
+_SIZING_ATR_PERIOD = 14
 
 logger = logging.getLogger(__name__)
 
@@ -368,7 +373,26 @@ class EntryFlow:
         consecutive_losses = await self.repo.get_consecutive_losses()
         sz_decimals = await self.exchange.get_sz_decimals(snapshot.symbol)
         tick_size = await self.exchange.get_tick_size(snapshot.symbol)
-        atr_estimate = self._estimate_atr(snapshot)
+        try:
+            atr_estimate = await self._calc_atr_for_sizing(snapshot)
+        except ExchangeError as e:
+            # ATR が候補ローソク足・24h レンジともに取得不能 → エントリー停止。
+            # 既存の place_orders_grouped 失敗経路と同じ entry_fail alert を発火。
+            logger.exception("ATR sizing failed")
+            await self.notifier.send_alert(
+                f"entry failed for {snapshot.symbol} {direction}: {e}",
+                dedup_key=f"entry_fail:{snapshot.symbol}:{direction}",
+            )
+            return EntryAttempt(
+                symbol=snapshot.symbol,
+                direction=direction,
+                decision=decision,
+                executed=False,
+                is_dry_run=False,
+                trade_id=None,
+                rejected_reason=str(e),
+                snapshot=snapshot,
+            )
         entry_price = Decimal(str(snapshot.current_price))
 
         sl_tp = calculate_sl_tp(
@@ -547,8 +571,78 @@ class EntryFlow:
             snapshot=snapshot,
         )
 
-    @staticmethod
-    def _estimate_atr(snapshot: MarketSnapshot) -> Decimal:
-        """24h レンジを 24 で割って 1h ATR の代わりに使う（章11.6 簡易実装）。"""
-        atr = (snapshot.high_24h - snapshot.low_24h) / 24
-        return Decimal(str(max(atr, 0.0001)))
+    async def _calc_atr_for_sizing(self, snapshot: MarketSnapshot) -> Decimal:
+        """SL/TP サイジング用 ATR(1h, 14)。
+
+        PR A2 (#1 of 5 mainnet first-trades bugs): 旧 ``_estimate_atr`` は
+        ``max(atr, 0.0001)`` の floor が付いており、HL の dayHigh/dayLow が
+        current_price 既定値にフォールバックする状況（実機で観測）で ATR が
+        0.0001 にクリップされ、stop_loss の min-1-tick 保証句と組み合わさって
+        SL/TP が常に entry±1tick になる事故が発生した（2026-05-15 mainnet
+        全 8 trade で確認）。
+
+        本実装は:
+        1. 1h ローソク足 ``_SIZING_ATR_LIMIT`` 本から ``calculate_atr`` で
+           実 ATR を計算（章13.3「ATR(1h, 14)」仕様準拠）
+        2. ローソク足取得失敗 / 本数不足時は ``(high_24h - low_24h) / 24`` に
+           フォールバック（旧簡易実装相当だが ``0.0001`` floor は撤去）
+        3. それでも ``<= 0`` なら ``ExchangeError`` を raise してエントリーを
+           止める（``_execute_entry`` の既存 except 経路で
+           ``entry_fail:{symbol}:{direction}`` alert に流れる）
+
+        floor を撤去したのは、不当な極小 ATR を黙って受け入れると stop_loss
+        の防御句（1 tick 保証）が常時発火し、極端な SL を生むため。
+
+        Returns:
+            実 ATR（USD 単位、銘柄通貨の絶対値）。
+
+        Raises:
+            ExchangeError: candle / 24h range の両方が利用不能で ATR を
+            計算できない時。
+        """
+        try:
+            candles = await self.exchange.get_candles(
+                snapshot.symbol,
+                _SIZING_ATR_INTERVAL,
+                _SIZING_ATR_LIMIT,
+            )
+        except ExchangeError as e:
+            logger.warning(
+                "ATR sizing candles fetch failed for %s: %s, "
+                "falling back to 24h range",
+                snapshot.symbol,
+                e,
+            )
+            candles = ()
+
+        if len(candles) >= _SIZING_ATR_PERIOD + 1:
+            return calculate_atr(
+                highs=[c.high for c in candles],
+                lows=[c.low for c in candles],
+                closes=[c.close for c in candles],
+                period=_SIZING_ATR_PERIOD,
+            )
+
+        if candles and len(candles) < _SIZING_ATR_PERIOD + 1:
+            logger.warning(
+                "ATR sizing got %d candles for %s (need %d), "
+                "falling back to 24h range",
+                len(candles),
+                snapshot.symbol,
+                _SIZING_ATR_PERIOD + 1,
+            )
+
+        # フォールバック: 24h レンジ / 24 （旧 _estimate_atr の本体）
+        fallback = (
+            Decimal(str(snapshot.high_24h))
+            - Decimal(str(snapshot.low_24h))
+        ) / Decimal("24")
+        if fallback > 0:
+            return fallback
+
+        # candle も 24h レンジも使えない → エントリー停止
+        raise ExchangeError(
+            f"ATR sizing unavailable for {snapshot.symbol}: "
+            f"no candles and 24h range invalid "
+            f"(high={snapshot.high_24h} low={snapshot.low_24h})"
+        )
