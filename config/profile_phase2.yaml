@@ -67,7 +67,7 @@ sentiment:
 # Scheduler: 慎重な間隔・リスク限界を厳しめに
 # ───────────────────────────────────────────────
 scheduler:
-  cycle_interval_seconds: 20.0  # ★ 10s → 20s で API 負荷を抑える（testnet 観察ベース）
+  cycle_interval_seconds: 30.0  # ★ 10s → 30s で API 負荷を抑える（testnet 観察ベース）
   reconcile_interval_seconds: 300.0
   circuit_breaker_enabled: true
   
