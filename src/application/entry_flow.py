@@ -551,6 +551,7 @@ class EntryFlow:
                 leverage=self.config.leverage,
                 is_dry_run=False,
                 decision=decision,
+                entry_order_id=results[0].order_id,
             )
         )
 

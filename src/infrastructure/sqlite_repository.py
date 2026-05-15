@@ -67,7 +67,24 @@ class SQLiteRepository:
             raise FileNotFoundError(f"schema not found: {SCHEMA_PATH}")
         with SCHEMA_PATH.open("r", encoding="utf-8") as f:
             await self._db.executescript(f.read())
+        await self._ensure_trades_columns()
         await self._db.commit()
+
+    async def _ensure_trades_columns(self) -> None:
+        """既存 DB の trades テーブルに後付けカラムを追加（冪等）。
+
+        ``CREATE TABLE IF NOT EXISTS`` は既存テーブルにカラムを追加しない
+        ため、PR B2 で追加した ``entry_order_id`` のような後付け列は
+        ``PRAGMA table_info`` で存在確認した上で ``ALTER TABLE`` する。
+        """
+        db = self._require_db()
+        async with db.execute("PRAGMA table_info(trades)") as cursor:
+            rows = await cursor.fetchall()
+        existing = {row[1] for row in rows}  # row[1] is column name
+        if "entry_order_id" not in existing:
+            await db.execute(
+                "ALTER TABLE trades ADD COLUMN entry_order_id TEXT"
+            )
 
     async def close(self) -> None:
         if self._db is not None:
@@ -83,9 +100,9 @@ class SQLiteRepository:
             INSERT INTO trades (
                 symbol, direction, leverage_used,
                 size_coins, entry_price, sl_price, tp_price,
-                is_dry_run, is_filled, entry_time
+                is_dry_run, is_filled, entry_time, entry_order_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
             """,
             (
                 request.symbol,
@@ -97,6 +114,11 @@ class SQLiteRepository:
                 _dec_to_real(request.tp_price),
                 1 if request.is_dry_run else 0,
                 _dt_iso(datetime.now(UTC)),
+                (
+                    str(request.entry_order_id)
+                    if request.entry_order_id is not None
+                    else None
+                ),
             ),
         )
         await db.commit()
@@ -622,6 +644,11 @@ def _row_to_trade(row: aiosqlite.Row) -> Trade:
             else None
         ),
         fill_time=_iso_to_dt(row["fill_time"]),
+        entry_order_id=(
+            int(row["entry_order_id"])
+            if row["entry_order_id"] is not None
+            else None
+        ),
     )
 
 

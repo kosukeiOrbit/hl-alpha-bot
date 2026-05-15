@@ -112,10 +112,17 @@ class StateReconciler:
             hl_positions, db_trades, hl_fills, errors
         )
 
+        # PR B2: db_trade で id -> ADAPTERS Trade を引けるようにしておく
+        # （_close_from_fill / _mark_manual_review が HL 注文 cleanup 用に
+        # entry_order_id / tp_order_id / sl_order_id を必要とする）。
+        db_trades_by_id = {t.id: t for t in db_trades}
+
         executed = 0
         for action in result.actions:
             try:
-                await self._apply_action(action, hl_fills)
+                await self._apply_action(
+                    action, hl_fills, db_trades_by_id, errors
+                )
                 executed += 1
             except Exception as e:
                 logger.exception("apply_action failed: %s", action.type)
@@ -228,6 +235,8 @@ class StateReconciler:
         self,
         action: ReconcileAction,
         adapter_fills: tuple[Fill, ...],
+        db_trades_by_id: dict[int, Trade],
+        errors: list[str],
     ) -> None:
         """ReconcileAction を副作用として実行（章9.3）。
 
@@ -247,13 +256,21 @@ class StateReconciler:
                 cast(HLPosition, action.hl_position),
             )
         elif t == ActionType.CLOSE_FROM_FILL:
+            db_trade = cast(DBTrade, action.db_trade)
             await self._close_from_fill(
-                cast(DBTrade, action.db_trade),
+                db_trade,
                 cast(HLFill, action.fill),
                 adapter_fills,
+                db_trades_by_id.get(db_trade.trade_id),
+                errors,
             )
         elif t == ActionType.MANUAL_REVIEW:
-            await self._mark_manual_review(cast(DBTrade, action.db_trade))
+            db_trade = cast(DBTrade, action.db_trade)
+            await self._mark_manual_review(
+                db_trade,
+                db_trades_by_id.get(db_trade.trade_id),
+                errors,
+            )
         else:
             logger.warning("unknown action type: %s", t)
 
@@ -293,11 +310,20 @@ class StateReconciler:
         db_trade: DBTrade,
         hl_fill: HLFill,
         adapter_fills: tuple[Fill, ...],
+        adapter_trade: Trade | None,
+        errors: list[str],
     ) -> None:
         """fill から決済記録。
 
         CORE の HLFill は closed_pnl / fee_usd を持たないため、
         元の ADAPTERS Fill を症候的にマッチングして取り戻す。
+
+        PR B2 (#4 of 5): DB を closed にする前に、HL 側に残っている
+        反対側の resting order（TP/SL のもう片方、entry ALO の残り）を
+        cancel する。これを行わないと、決済済みに見える DB と裏腹に
+        HL 側で SL/TP が宙ぶらりんになり、次サイクル以降に外部約定の
+        ような形で意図しない約定が起きる。cancel 失敗（既約定 / 既
+        cancel）はログのみで継続する（close 処理本体を止めない）。
         """
         adapter_fill = _find_adapter_fill(hl_fill, adapter_fills)
         if adapter_fill is None:
@@ -306,6 +332,9 @@ class StateReconciler:
                 db_trade.trade_id,
             )
             return
+        await self._cancel_known_orders(
+            db_trade.symbol, adapter_trade, errors, reason="close_from_fill"
+        )
         await self.repo.close_trade_from_fill(
             trade_id=db_trade.trade_id, fill=adapter_fill
         )
@@ -315,13 +344,67 @@ class StateReconciler:
             dedup_key=f"close_from_fill:{db_trade.trade_id}",
         )
 
-    async def _mark_manual_review(self, db_trade: DBTrade) -> None:
+    async def _mark_manual_review(
+        self,
+        db_trade: DBTrade,
+        adapter_trade: Trade | None,
+        errors: list[str],
+    ) -> None:
+        """MANUAL_REVIEW 印を立てる + HL 側 cleanup（PR B2 #4）。
+
+        ``MANUAL_REVIEW`` は HL 側にも DB 側にもポジションが無い／
+        曖昧な状態を運用者に知らせる経路だが、`is_filled=1` の trade に
+        対応する resting TP/SL が宙ぶらりんなままだと将来の誤約定の元。
+        そのため CLOSE_FROM_FILL と同じく HL の cleanup を併せて行う。
+        """
+        await self._cancel_known_orders(
+            db_trade.symbol, adapter_trade, errors, reason="manual_review"
+        )
         await self.repo.mark_manual_review(db_trade.trade_id)
         await self.notifier.send_alert(
             f"manual review needed: trade_id={db_trade.trade_id} "
             f"({db_trade.symbol})",
             dedup_key=f"manual:{db_trade.trade_id}",
         )
+
+    async def _cancel_known_orders(
+        self,
+        symbol: str,
+        adapter_trade: Trade | None,
+        errors: list[str],
+        *,
+        reason: str,
+    ) -> None:
+        """DB が把握している entry/TP/SL HL 注文を best-effort で cancel。
+
+        既約定・既 cancel・unknown oid いずれも ``ExchangeError`` で返って
+        くるので、ログを残しつつ ``errors`` に積んで継続する。close 処理
+        本体を止めないことが重要（DB と HL の状態乖離が拡大しないように）。
+        """
+        if adapter_trade is None:
+            return
+        candidates: tuple[tuple[str, int | None], ...] = (
+            ("entry", adapter_trade.entry_order_id),
+            ("tp", adapter_trade.tp_order_id),
+            ("sl", adapter_trade.sl_order_id),
+        )
+        for kind, oid in candidates:
+            if oid is None:
+                continue
+            try:
+                await self.exchange.cancel_order(order_id=oid, symbol=symbol)
+            except ExchangeError as e:
+                logger.warning(
+                    "%s cancel_order failed (oid=%d, kind=%s, trade=%d): %s",
+                    reason,
+                    oid,
+                    kind,
+                    adapter_trade.id,
+                    e,
+                )
+                errors.append(
+                    f"{reason}_cancel_{kind}_{adapter_trade.id}: {e}"
+                )
 
     # ─── stale order cleanup ──────────────────
 

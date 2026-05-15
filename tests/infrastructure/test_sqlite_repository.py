@@ -253,6 +253,87 @@ class TestStateUpdates:
         assert trade.sl_order_id is None
 
     @pytest.mark.asyncio
+    async def test_entry_order_id_round_trip(
+        self, repo: SQLiteRepository
+    ) -> None:
+        # PR B2: open_trade で渡された entry_order_id が round-trip する
+        tid = await repo.open_trade(make_open_request(entry_order_id=99999))
+        trade = await repo.get_trade(tid)
+        assert trade is not None
+        assert trade.entry_order_id == 99999
+
+    @pytest.mark.asyncio
+    async def test_entry_order_id_defaults_to_none(
+        self, repo: SQLiteRepository
+    ) -> None:
+        # entry_order_id を渡さない既存呼び出し（後方互換）でも壊れない
+        tid = await repo.open_trade(make_open_request())
+        trade = await repo.get_trade(tid)
+        assert trade is not None
+        assert trade.entry_order_id is None
+
+    @pytest.mark.asyncio
+    async def test_ensure_columns_adds_missing_entry_order_id(
+        self, tmp_path: Any
+    ) -> None:
+        """PR B2 マイグレーション: PR B2 以前のスキーマで作られた DB を
+        新コードで開いても、entry_order_id 列が自動付与される。
+        """
+        import aiosqlite
+
+        db_path = tmp_path / "legacy.db"
+        # PR B2 以前相当のスキーマで trades テーブルだけ手動作成
+        async with aiosqlite.connect(db_path) as legacy:
+            await legacy.execute(
+                """
+                CREATE TABLE trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    leverage_used INTEGER NOT NULL DEFAULT 0,
+                    tp_order_id TEXT,
+                    sl_order_id TEXT,
+                    size_coins REAL NOT NULL,
+                    entry_price REAL NOT NULL,
+                    actual_entry_price REAL,
+                    sl_price REAL NOT NULL,
+                    tp_price REAL NOT NULL,
+                    exit_price REAL,
+                    is_filled INTEGER NOT NULL DEFAULT 0,
+                    is_dry_run INTEGER NOT NULL DEFAULT 1,
+                    is_manual_review INTEGER NOT NULL DEFAULT 0,
+                    is_external INTEGER NOT NULL DEFAULT 0,
+                    resumed_at TEXT,
+                    entry_time TEXT NOT NULL,
+                    exit_time TEXT,
+                    fill_time TEXT,
+                    closed_at TEXT,
+                    pnl_usd REAL,
+                    fee_usd_total REAL,
+                    funding_paid_usd REAL,
+                    mfe_pct REAL,
+                    mae_pct REAL,
+                    exit_reason TEXT,
+                    vwap_metrics TEXT
+                )
+                """
+            )
+            await legacy.commit()
+        r = SQLiteRepository(db_path)
+        await r.initialize()
+        assert r._db is not None
+        async with r._db.execute("PRAGMA table_info(trades)") as cur:
+            cols = await cur.fetchall()
+        names = {row[1] for row in cols}
+        assert "entry_order_id" in names
+        # 新コードで insert / select も壊れない
+        tid = await r.open_trade(make_open_request(entry_order_id=42))
+        trade = await r.get_trade(tid)
+        assert trade is not None
+        assert trade.entry_order_id == 42
+        await r.close()
+
+    @pytest.mark.asyncio
     async def test_update_mfe_mae(self, repo: SQLiteRepository) -> None:
         tid = await repo.open_trade(make_open_request())
         await repo.update_mfe_mae(tid, Decimal("3.5"), Decimal("-1.0"))

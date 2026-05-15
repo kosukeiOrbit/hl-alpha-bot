@@ -63,6 +63,7 @@ def make_trade(**overrides: Any) -> Trade:
         "tp_order_id": None,
         "sl_order_id": None,
         "fill_time": None,
+        "entry_order_id": None,
     }
     base.update(overrides)
     return Trade(**base)

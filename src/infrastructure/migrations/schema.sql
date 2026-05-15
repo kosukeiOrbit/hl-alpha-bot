@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS trades (
     leverage_used   INTEGER NOT NULL DEFAULT 0,
 
     -- HL 注文 ID（HL の oid は数値だが、表記の安定のため TEXT 保存）
+    -- entry_order_id は PR B2 で追加（既存 DB には ALTER TABLE で後付け）。
+    entry_order_id  TEXT,
     tp_order_id     TEXT,
     sl_order_id     TEXT,
 

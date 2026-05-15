@@ -77,6 +77,7 @@ def make_trade(**overrides: Any) -> Trade:
         "actual_entry_price": Decimal("65000"),
         "tp_order_id": None,
         "sl_order_id": None,
+        "entry_order_id": None,
     }
     base.update(overrides)
     return Trade(**base)
@@ -459,7 +460,7 @@ class TestApplyActionDispatch:
         # type を unknown 文字列に差し替え
         object.__setattr__(action, "type", "BOGUS")
         with caplog.at_level("WARNING"):
-            await reconciler._apply_action(action, ())
+            await reconciler._apply_action(action, (), {}, [])
         assert any("unknown action type" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
@@ -493,7 +494,7 @@ class TestApplyActionDispatch:
             fill=hl_fill,
         )
         with caplog.at_level("WARNING"):
-            await reconciler._apply_action(action, (non_matching,))
+            await reconciler._apply_action(action, (non_matching,), {}, [])
         repo.close_trade_from_fill.assert_not_awaited()
         assert any(
             "matching adapter fill not found" in r.message
@@ -696,3 +697,134 @@ class TestIsFilledFilter:
         # その引数は filled の trade_id=1
         call = repo.close_trade_from_fill.await_args
         assert call.kwargs.get("trade_id") == filled.id or call.args[0] == filled.id
+
+
+# ─── PR B2 (#4): HL 注文 cleanup ───────────
+
+
+class TestHLOrderCleanup:
+    """``_close_from_fill`` と ``_mark_manual_review`` の HL 注文 cleanup（PR B2 #4）。
+
+    2026-05-15 mainnet で MANUAL クローズした trade に対応する SL/TP が
+    HL 側で resting し続け、後続で意図しない約定リスクが残った事例の
+    構造的修正。trade.entry_order_id / tp_order_id / sl_order_id が
+    存在する場合に best-effort で ``exchange.cancel_order`` を呼ぶ。
+    """
+
+    @pytest.mark.asyncio
+    async def test_close_from_fill_cancels_known_orders(self) -> None:
+        trade = make_trade(
+            is_filled=True,
+            entry_order_id=111,
+            tp_order_id=222,
+            sl_order_id=333,
+        )
+        fill = make_fill(
+            symbol="BTC", side="sell",
+            size=trade.size_coins, price=Decimal("66000"),
+            timestamp_ms=int(trade.entry_time.timestamp() * 1000) + 60_000,
+        )
+        reconciler, exchange, repo, _ = build_reconciler(
+            positions=(), open_trades=(trade,), fills=(fill,)
+        )
+        summary = await reconciler.restore_on_startup()
+        # entry / tp / sl の 3 件すべてキャンセル試行
+        assert exchange.cancel_order.await_count == 3
+        called_oids = {
+            c.kwargs["order_id"] for c in exchange.cancel_order.await_args_list
+        }
+        assert called_oids == {111, 222, 333}
+        # close 処理本体は正常に走る
+        repo.close_trade_from_fill.assert_awaited_once()
+        assert summary.errors == ()
+
+    @pytest.mark.asyncio
+    async def test_manual_review_cancels_known_orders(self) -> None:
+        # HL にポジション無し / 対応 fill 無し → MANUAL_REVIEW
+        trade = make_trade(
+            is_filled=True,
+            tp_order_id=222,
+            sl_order_id=333,
+        )
+        reconciler, exchange, repo, _ = build_reconciler(
+            positions=(), open_trades=(trade,), fills=()
+        )
+        summary = await reconciler.restore_on_startup()
+        # entry_order_id は None なので tp/sl の 2 件
+        assert exchange.cancel_order.await_count == 2
+        called_oids = {
+            c.kwargs["order_id"] for c in exchange.cancel_order.await_args_list
+        }
+        assert called_oids == {222, 333}
+        repo.mark_manual_review.assert_awaited_once()
+        assert summary.errors == ()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_skips_none_order_ids(self) -> None:
+        # 全部 None → cancel_order は呼ばれない（早期分岐）
+        trade = make_trade(is_filled=True)  # 全 order_id None
+        fill = make_fill(
+            symbol="BTC", side="sell",
+            size=trade.size_coins, price=Decimal("66000"),
+            timestamp_ms=int(trade.entry_time.timestamp() * 1000) + 60_000,
+        )
+        reconciler, exchange, repo, _ = build_reconciler(
+            positions=(), open_trades=(trade,), fills=(fill,)
+        )
+        await reconciler.restore_on_startup()
+        exchange.cancel_order.assert_not_awaited()
+        repo.close_trade_from_fill.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_continues_when_cancel_raises(self) -> None:
+        # 既約定 / 既 cancel で cancel_order が ExchangeError を投げても
+        # close 処理本体は止まらない。errors に記録される。
+        trade = make_trade(
+            is_filled=True,
+            entry_order_id=111,
+            tp_order_id=222,
+            sl_order_id=333,
+        )
+        fill = make_fill(
+            symbol="BTC", side="sell",
+            size=trade.size_coins, price=Decimal("66000"),
+            timestamp_ms=int(trade.entry_time.timestamp() * 1000) + 60_000,
+        )
+        reconciler, exchange, repo, _ = build_reconciler(
+            positions=(), open_trades=(trade,), fills=(fill,),
+            cancel_order_side_effect=ExchangeError("order is filled"),
+        )
+        summary = await reconciler.restore_on_startup()
+        # 3 件すべて試行（成功失敗にかかわらず continue）
+        assert exchange.cancel_order.await_count == 3
+        # close 処理本体は走る
+        repo.close_trade_from_fill.assert_awaited_once()
+        # errors に 3 件積まれる（entry / tp / sl）
+        cleanup_errors = [
+            e for e in summary.errors if "close_from_fill_cancel" in e
+        ]
+        assert len(cleanup_errors) == 3
+
+    @pytest.mark.asyncio
+    async def test_cleanup_no_op_when_adapter_trade_missing(self) -> None:
+        """db_trades_by_id に該当 id が無い場合（理論上は CORE 純関数の
+        DBTrade に変換した trade_id しか来ないので発生しないが、防御的に
+        no-op になることを確認）。
+
+        手段: ``_apply_action`` を直接呼び、``db_trades_by_id={}`` を渡す。
+        """
+        reconciler, exchange, repo, _ = build_reconciler()
+        action = ReconcileAction(
+            type=ActionType.MANUAL_REVIEW,
+            db_trade=DBTrade(
+                trade_id=9999,
+                symbol="BTC",
+                direction="LONG",
+                size=Decimal("0.0002"),
+                entry_price=Decimal("65000"),
+                entry_time_ms=1_000_000_000_000,
+            ),
+        )
+        await reconciler._apply_action(action, (), {}, [])
+        exchange.cancel_order.assert_not_awaited()
+        repo.mark_manual_review.assert_awaited_once()

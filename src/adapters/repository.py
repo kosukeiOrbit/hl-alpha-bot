@@ -29,6 +29,10 @@ class Trade:
     is_filled / actual_entry_price / tp_order_id / sl_order_id は
     PR7.2 で追加。grouped 発注時点では tp/sl の order_id は不明で、
     entry が約定してから position_monitor が紐付ける（章14.6）。
+
+    PR B2 (#4 of 5): entry_order_id を追加。entry ALO の HL oid を保存
+    し、MANUAL クローズ / CLOSE_FROM_FILL 時に reconciler が HL 側の
+    resting order を確実に取り消せるようにする（DB と HL の状態乖離を防ぐ）。
     """
 
     id: int
@@ -55,6 +59,7 @@ class Trade:
     tp_order_id: int | None = None
     sl_order_id: int | None = None
     fill_time: datetime | None = None
+    entry_order_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +75,7 @@ class TradeOpenRequest:
     leverage: int
     is_dry_run: bool
     decision: EntryDecision  # 判定結果を保存（後で分析用）
+    entry_order_id: int | None = None  # PR B2: entry ALO の HL oid
 
 
 @dataclass(frozen=True)
