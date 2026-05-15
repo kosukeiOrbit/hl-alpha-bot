@@ -131,6 +131,9 @@ def build_scheduler(
     repo.get_daily_pnl_usd = AsyncMock(return_value=daily_pnl)
     # PR7.4-real: weekly_loss_pct 計算用
     repo.get_pnl_since = AsyncMock(return_value=Decimal("0"))
+    # PR A1 (#2): max_position_count ゲート用。既定は空 tuple で
+    # 「open trade 無し」状態にする。個別テストで上書き可能。
+    repo.get_open_trades = AsyncMock(return_value=())
 
     notifier = AsyncMock()
     if notifier_side_effect is not None:
@@ -255,6 +258,109 @@ class TestRunCycleOnce:
         assert stats.monitor_closed == 1
         assert stats.monitor_forced_closes == 1
         assert stats.monitor_errors == 2
+
+
+# ─── PR A1 (#2): max_position_count 発注時ゲート ─
+
+
+def _fake_trade(trade_id: int) -> Any:
+    """get_open_trades の戻り値モック用。len() だけ使うので最小限。"""
+    t = MagicMock()
+    t.id = trade_id
+    return t
+
+
+class TestMaxPositionCountGate:
+    """既存 open trade 数が max_position_count 以上なら entry pass を skip。
+
+    DB の open trades（is_filled に関わらず exit_time IS NULL のもの）を
+    数えるので、ALO で resting 中の注文も計上される。HL 側 position 数
+    （CircuitBreaker Layer 7）ではなく DB ベース。
+    """
+
+    @pytest.mark.asyncio
+    async def test_skips_when_open_trades_equal_max(self) -> None:
+        scheduler, _, repo, _, entry_flow, _, _ = build_scheduler(
+            config=make_config(max_position_count=1),
+        )
+        repo.get_open_trades = AsyncMock(return_value=(_fake_trade(1),))
+        stats = await scheduler.run_cycle_once()
+        # entry_flow は呼ばれない
+        entry_flow.evaluate_and_enter.assert_not_awaited()
+        # cycle stats は 0/0/0/0
+        assert stats.entry_attempts == 0
+        assert stats.entry_executed == 0
+        assert stats.entry_dryrun == 0
+        assert stats.entry_errors == 0
+
+    @pytest.mark.asyncio
+    async def test_skips_when_open_trades_exceed_max(self) -> None:
+        scheduler, _, repo, _, entry_flow, _, _ = build_scheduler(
+            config=make_config(max_position_count=1),
+        )
+        repo.get_open_trades = AsyncMock(
+            return_value=(_fake_trade(1), _fake_trade(2))
+        )
+        stats = await scheduler.run_cycle_once()
+        entry_flow.evaluate_and_enter.assert_not_awaited()
+        assert stats.entry_attempts == 0
+
+    @pytest.mark.asyncio
+    async def test_proceeds_when_open_trades_below_max(self) -> None:
+        scheduler, _, repo, _, entry_flow, _, _ = build_scheduler(
+            config=make_config(max_position_count=2),
+        )
+        repo.get_open_trades = AsyncMock(return_value=(_fake_trade(1),))
+        stats = await scheduler.run_cycle_once()
+        # 1 open trade < max 2 なので entry pass は走る
+        entry_flow.evaluate_and_enter.assert_awaited()
+        assert stats.entry_attempts > 0
+
+    @pytest.mark.asyncio
+    async def test_proceeds_when_no_open_trades(self) -> None:
+        scheduler, _, _, _, entry_flow, _, _ = build_scheduler(
+            config=make_config(max_position_count=1),
+        )
+        # 既定 helper で get_open_trades=() なので gate は通過
+        stats = await scheduler.run_cycle_once()
+        entry_flow.evaluate_and_enter.assert_awaited()
+        assert stats.entry_attempts == 2  # watchlist=(BTC,ETH) × directions=(LONG,)
+
+    @pytest.mark.asyncio
+    async def test_gate_uses_db_not_hl_positions(self) -> None:
+        """resting 中の DB trade も計上することの確認（is_filled に依存しない）。
+
+        重要な不変条件: HL の get_positions() は ALO resting を返さないが、
+        DB の get_open_trades() は返す。本ゲートは DB ベースで動くべき。
+        """
+        scheduler, exchange, repo, _, entry_flow, _, _ = build_scheduler(
+            config=make_config(max_position_count=1),
+        )
+        # HL 側はポジションなし（cycle 直前に発注した resting）
+        exchange.get_positions = AsyncMock(return_value=())
+        # DB 側は 1 trade あり（資金は別の resting）
+        repo.get_open_trades = AsyncMock(return_value=(_fake_trade(1),))
+        await scheduler.run_cycle_once()
+        # HL は 0 だが DB は 1 なので gate が機能して entry はスキップ
+        entry_flow.evaluate_and_enter.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_gate_logs_skip_message(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging as _logging
+
+        scheduler, _, repo, _, _, _, _ = build_scheduler(
+            config=make_config(max_position_count=1),
+        )
+        repo.get_open_trades = AsyncMock(return_value=(_fake_trade(1),))
+        with caplog.at_level(
+            _logging.INFO, logger="src.application.scheduler"
+        ):
+            await scheduler.run_cycle_once()
+        assert any(
+            "entry pass skipped" in r.message for r in caplog.records
+        )
 
 
 # ─── サーキットブレーカー ──────────────

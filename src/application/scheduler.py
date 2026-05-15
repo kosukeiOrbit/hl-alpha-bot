@@ -286,6 +286,23 @@ class Scheduler:
         Returns:
             (attempts, executed, dryrun, errors)
         """
+        # PR A1 (#2): max_position_count を発注時ゲートとして強制適用。
+        # 既存の CircuitBreaker Layer 7 は overflow_multiplier=1.5 がかかる
+        # ため max_position_count=1 でも 2 件目までは通ってしまう。さらに
+        # CB は HL 側の position 数を見るため、ALO 等で resting 中の
+        # 注文は計上されず、cycle ごとに新規発注を重ねる事故になる
+        # （2026-05-15 mainnet 実弾モード初日に 8 trades 連続発注で顕在化）。
+        # DB の open trades（is_filled に関わらず exit_time IS NULL のもの）
+        # を数え、max_position_count に達していれば pass 全体を skip する。
+        open_trades = await self.repo.get_open_trades()
+        if len(open_trades) >= self.config.max_position_count:
+            logger.info(
+                "entry pass skipped: open_trades=%d >= max_position_count=%d",
+                len(open_trades),
+                self.config.max_position_count,
+            )
+            return 0, 0, 0, 0
+
         attempts = 0
         executed = 0
         dryrun = 0
