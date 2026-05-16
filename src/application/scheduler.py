@@ -239,8 +239,16 @@ class Scheduler:
     # ─── 1 サイクル ─────────────────────────
 
     async def run_cycle_once(self) -> CycleStats:
-        """1 サイクル実行（テスト時にも呼べる単位）。"""
+        """1 サイクル実行（テスト時にも呼べる単位）。
+
+        PR D1: cycle 開始時に exchange の meta キャッシュをクリアする。
+        この cycle 内で複数経路（snapshot / funding / OI / symbols）が
+        同じ ``meta_and_asset_ctxs`` を要求しても、HL API へは 1 回だけ
+        投げる構造。429 リスク低減と将来の per-symbol REGIME / watchlist
+        拡大に向けた基盤（PR D2 / D3）。
+        """
         cycle_start = datetime.now(UTC)
+        await self.exchange.invalidate_meta_cache()
 
         breaker_result = await self._check_circuit_breaker()
         await self._notify_breaker_transition(breaker_result)

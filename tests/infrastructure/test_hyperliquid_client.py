@@ -2706,3 +2706,99 @@ class TestE2ETriggerOrder:
         )
         with pytest.raises(ExchangeError, match="limit_price is required"):
             await client.place_trigger_order(bad)
+
+
+# ────────────────────────────────────────────────
+# PR D1: meta_and_asset_ctxs cycle cache
+# ────────────────────────────────────────────────
+
+
+def _meta_response_for_cache_tests() -> list[Any]:
+    """キャッシュ系テスト用の最小 meta_and_asset_ctxs 応答。"""
+    return [
+        {"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 50}]},
+        [{"markPx": "65000", "openInterest": "100", "funding": "0.0000125"}],
+    ]
+
+
+class TestMetaCache:
+    """``_fetch_meta_and_ctxs`` の cycle cache（PR D1）。
+
+    1 cycle 内で複数経路（snapshot / funding / OI / symbols）が同じ
+    HL meta_and_asset_ctxs を要求しても API は 1 回だけ呼ばれる。
+    scheduler が ``invalidate_meta_cache`` を cycle 開始時に呼ぶ前提。
+    """
+
+    @pytest.mark.asyncio
+    async def test_second_fetch_within_ttl_hits_cache(self) -> None:
+        client = HyperLiquidClient(network="testnet")
+        client._info = MagicMock()
+        client._info.meta_and_asset_ctxs = MagicMock(
+            return_value=_meta_response_for_cache_tests()
+        )
+
+        # symbols cache を経由しない 2 経路（funding / OI）を連続で呼ぶ。
+        # _fetch_meta_and_ctxs は 1 回しか走らないはず。
+        await client.get_funding_rate_8h("BTC")
+        await client.get_open_interest("BTC")
+        assert client._info.meta_and_asset_ctxs.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_invalidate_forces_refetch(self) -> None:
+        client = HyperLiquidClient(network="testnet")
+        client._info = MagicMock()
+        client._info.meta_and_asset_ctxs = MagicMock(
+            return_value=_meta_response_for_cache_tests()
+        )
+
+        await client.get_funding_rate_8h("BTC")
+        await client.invalidate_meta_cache()
+        await client.get_open_interest("BTC")
+        # invalidate を挟むと 2 回叩く。
+        assert client._info.meta_and_asset_ctxs.call_count == 2
+        assert client._meta_cache is not None  # 2 回目で再充填
+
+    @pytest.mark.asyncio
+    async def test_cache_expires_after_ttl(self) -> None:
+        # TTL を 0 に強制して即座に expire させる。
+        client = HyperLiquidClient(network="testnet")
+        client._info = MagicMock()
+        client._info.meta_and_asset_ctxs = MagicMock(
+            return_value=_meta_response_for_cache_tests()
+        )
+        # クラス定数を一時的に上書き
+        original_ttl = HyperLiquidClient._META_CACHE_TTL_SECONDS
+        try:
+            HyperLiquidClient._META_CACHE_TTL_SECONDS = 0.0  # type: ignore[misc]
+            await client.get_funding_rate_8h("BTC")
+            await client.get_open_interest("BTC")
+            # TTL=0 → 毎回 API 叩く
+            assert client._info.meta_and_asset_ctxs.call_count == 2
+        finally:
+            HyperLiquidClient._META_CACHE_TTL_SECONDS = original_ttl  # type: ignore[misc]
+
+    @pytest.mark.asyncio
+    async def test_initial_cache_is_none(self) -> None:
+        client = HyperLiquidClient(network="testnet")
+        assert client._meta_cache is None
+
+    @pytest.mark.asyncio
+    async def test_invalidate_when_cache_empty_is_noop(self) -> None:
+        # invalidate を空キャッシュに対して呼んでも壊れない（idempotent）。
+        client = HyperLiquidClient(network="testnet")
+        await client.invalidate_meta_cache()
+        assert client._meta_cache is None
+
+    @pytest.mark.asyncio
+    async def test_cache_shares_across_method_paths(self) -> None:
+        """get_symbols / get_funding_rate_8h / get_open_interest の 3 経路が
+        同じ ``_meta_cache`` を共有する（symbols cache は別レイヤー）。"""
+        client = HyperLiquidClient(network="testnet")
+        client._info = MagicMock()
+        client._info.meta_and_asset_ctxs = MagicMock(
+            return_value=_meta_response_for_cache_tests()
+        )
+        await client.get_symbols()  # _symbols_cache + _meta_cache 両方を埋める
+        await client.get_funding_rate_8h("BTC")
+        await client.get_open_interest("BTC")
+        assert client._info.meta_and_asset_ctxs.call_count == 1

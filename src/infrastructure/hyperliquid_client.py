@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -66,6 +67,10 @@ class HyperLiquidClient:
     MAINNET_EXCHANGE_URL = "https://api.hyperliquid.xyz"
     TESTNET_EXCHANGE_URL = "https://api.hyperliquid-testnet.xyz"
 
+    # PR D1: meta_and_asset_ctxs キャッシュの TTL（秒）。明示 invalidate
+    # の取りこぼし時の safety net。cycle_interval=30s に対して十分小さい。
+    _META_CACHE_TTL_SECONDS: ClassVar[float] = 1.0
+
     def __init__(
         self,
         network: str = "testnet",
@@ -92,6 +97,13 @@ class HyperLiquidClient:
         # 初回 get_account_balance_usd 時に検出してキャッシュ。
         # アカウント設定は BOT 稼働中に変わらないので一度で十分。
         self._abstraction_state: str | None = None
+        # PR D1: meta_and_asset_ctxs を 1 cycle 内で 1 回だけ叩くキャッシュ。
+        # tuple は (meta, asset_ctxs, monotonic_fetched_at)。
+        # scheduler が cycle 開始時に invalidate_meta_cache を呼んでクリア
+        # する設計（明示クリア基本・TTL は異常時の safety net）。
+        self._meta_cache: (
+            tuple[dict[str, Any], list[dict[str, Any]], float] | None
+        ) = None
 
     @property
     def info(self) -> Info:
@@ -263,14 +275,34 @@ class HyperLiquidClient:
     # ─── 内部ヘルパー ───
 
     async def _fetch_meta_and_ctxs(self) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        """SDK の meta_and_asset_ctxs を呼び (meta, asset_ctxs) を返す。"""
+        """SDK の meta_and_asset_ctxs を呼び (meta, asset_ctxs) を返す。
+
+        PR D1: 1 cycle 内で複数経路（snapshot / funding / OI / symbols）が
+        同じデータを必要とするため、cycle 単位でキャッシュする。
+        scheduler が ``invalidate_meta_cache`` を cycle 開始時に呼んで
+        明示クリアする。``_META_CACHE_TTL_SECONDS`` は invalidate が
+        呼ばれなかった場合の safety net（cycle_interval よりはるかに短い）。
+        """
+        if self._meta_cache is not None:
+            meta, asset_ctxs, fetched_at = self._meta_cache
+            if time.monotonic() - fetched_at < self._META_CACHE_TTL_SECONDS:
+                return meta, asset_ctxs
         try:
             response = await asyncio.to_thread(self.info.meta_and_asset_ctxs)
         except Exception as e:
             raise ExchangeError(f"Failed to fetch symbols: {e}") from e
         meta = response[0]
         asset_ctxs = response[1]
+        self._meta_cache = (meta, asset_ctxs, time.monotonic())
         return meta, asset_ctxs
+
+    async def invalidate_meta_cache(self) -> None:
+        """meta_and_asset_ctxs キャッシュをクリア（PR D1）。
+
+        scheduler が各 cycle 開始時に呼ぶ。次の ``_fetch_meta_and_ctxs``
+        は確実に HL API を叩いて最新値を取得する。
+        """
+        self._meta_cache = None
 
     # ─── MarketSnapshot 構築（章4 4層AND判定の入力） ───
 

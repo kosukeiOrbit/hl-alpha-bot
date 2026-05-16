@@ -233,3 +233,12 @@ class ExchangeProtocol(Protocol):
     async def get_tick_size(self, symbol: str) -> Decimal: ...
 
     async def get_sz_decimals(self, symbol: str) -> int: ...
+
+    # ─── キャッシュ操作（PR D1） ───
+    async def invalidate_meta_cache(self) -> None:
+        """meta_and_asset_ctxs キャッシュをクリアする（章19）。
+
+        scheduler が各 cycle 開始時に呼び、その cycle 内では同 API を
+        1 回だけ叩くようにする。実装側で no-op でも構わない。
+        """
+        ...

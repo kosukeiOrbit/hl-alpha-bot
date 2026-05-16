@@ -213,6 +213,15 @@ class TestRunCycleOnce:
         assert stats.circuit_breaker_active is False
 
     @pytest.mark.asyncio
+    async def test_invalidates_meta_cache_at_cycle_start(self) -> None:
+        # PR D1: 各 cycle 開始時に exchange の meta キャッシュをクリア。
+        # この cycle 内で何度 _fetch_meta_and_ctxs が呼ばれても HL API は
+        # 1 回だけ叩く前提。
+        scheduler, exchange, _, _, _, _, _ = build_scheduler()
+        await scheduler.run_cycle_once()
+        exchange.invalidate_meta_cache.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_executed_attempt_increments_executed(self) -> None:
         scheduler, _, _, _, _, _, _ = build_scheduler(
             entry_attempt_factory=lambda symbol, direction: make_attempt(
