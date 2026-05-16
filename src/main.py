@@ -183,6 +183,7 @@ def build_scheduler(
             momentum_vwap_max_distance_pct=(
                 settings.momentum.vwap_max_distance_pct
             ),
+            regime_trend_source=settings.regime.trend_source,
         ),
     )
 

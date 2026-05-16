@@ -249,6 +249,16 @@ AND abs(snap.oi_change_1h_pct) < _LONG_OI_CHANGE_MAX_PCT
 funding が +0.03% 未満なら、その銘柄自身が下落トレンドでも SHORT REGIME
 は閉じる。この設計の現実的影響は章15.4.11 で定量データ付きで記録する。
 
+**PR D2 (2026-05-16) 補足:** EMA トレンドと ATR の出所は profile から
+切替可能になった。``config/profile_phase2.yaml`` の
+``regime.trend_source`` で ``"btc"`` (デフォルト・上記の従来動作) /
+``"symbol"`` (銘柄自身の 15m EMA20/50 + ATR(14)) を選択する。
+``judge_long_entry`` / ``judge_short_entry`` の ``regime_trend_source``
+kwarg として CORE に注入される。``funding_rate`` / ``oi_change_1h_pct``
+は引き続き銘柄個別の値を使用し、構造変更は EMA / ATR ソースのみ。
+両モードの判定結果は signals テーブルに並べて記録され、事後分析可能
+（詳細は §20.4.B）。
+
 注: `src/core/regime.py` に似た名前の純関数群（`judge_regime_long/short`）が
 あるが、`entry_judge.py` からは呼ばれていない未使用コード（PR7.x の歴史的
 経緯による）。判定の実体は `entry_judge.py` 側にある。
@@ -5832,6 +5842,36 @@ PR7.6.7 時点で改善候補の優先度を実観察データに基づいて更
 後半は増分ゼロ」と定量化され、**MOMENTUM がより太いボトルネック**である
 ことが判明。REGIME 単独修正の費用対効果は低く、Phase 4 で BTC.D と
 合わせて精緻化する原方針を維持。
+
+**部分的実装 (PR D2, 2026-05-16):** per-symbol REGIME の **計算経路**
+だけは先行実装した（適用は config 切替）。
+
+- ``MarketSnapshot`` に ``symbol_ema_trend`` / ``symbol_atr_pct`` を追加。
+  デフォルトは ``"NEUTRAL"`` / ``0.0``。
+- ``EntryFlow._build_snapshot`` が ``_calc_ema_trend_for(symbol, snap)``
+  / ``_calc_atr_pct_for(symbol, snap)`` で銘柄自身の 15m EMA20/50 と
+  ATR(14) を計算（BTC 用と同じ純関数ロジックを共有）。
+  ``symbol == "BTC"`` のときは API 重複を避けて BTC の値を再利用。
+- CORE の ``judge_long_entry`` / ``judge_short_entry`` に
+  ``regime_trend_source: Literal["btc", "symbol"] = "btc"`` kwarg を追加。
+  ``_check_regime_long`` / ``_check_regime_short`` 内部の
+  ``_select_regime_inputs`` ヘルパーが trend_source から EMA / ATR
+  ソースを選ぶ（判定式そのものは共通）。
+- ``RegimeSettings(trend_source: Literal["btc", "symbol"] = "btc")`` を
+  `config/schema.py` に追加。``profile_phase2.yaml`` の ``regime:``
+  セクションで明示。Phase 0/1 profile は無修正で動作（pydantic デフォルト）。
+- ``EntryFlow._log_signals`` が両モードの判定結果を 1 つの
+  ``snapshot_excerpt`` JSON に並べて記録する（``regime_btc_passed``,
+  ``regime_symbol_passed``, ``active_trend_source`` を追加）。事後 SQL
+  ``json_extract(snapshot_excerpt, '$.regime_symbol_passed')`` 等で
+  「もう一方の mode に切り替えていたら何 cycle 通過したか」を再評価可能。
+
+Phase 4 への移行点:
+- 当面 ``trend_source = "btc"`` を維持して両モードのデータを蓄積。
+- 1〜2 週間後に signals テーブルを SQL 集計し、symbol モードに切り替える
+  価値があるかを判断。
+- ``combine_mode`` (e.g. ``btc AND symbol`` / ``btc OR symbol``) や
+  BTC.D 統合は本 PR の射程外（Phase 4）。
 
 
 ---

@@ -69,6 +69,10 @@ class EntryFlowConfig:
     を追加。CORE の judge_long_entry / judge_short_entry に注入することで
     profile 経由で帯幅を上書き可能にする。省略時は従来値 ±0.5 が CORE 側の
     kwarg デフォルトに残っているため、テスト・既存 profile への影響は無い。
+
+    PR D2: ``regime_trend_source`` を追加。"btc" (デフォルト) は従来の
+    BTC レジームで判定、"symbol" は銘柄自身の 15m EMA20/50 + ATR(14) で
+    判定。両モードの判定結果は常に signals テーブルに記録される。
     """
 
     is_dry_run: bool
@@ -80,6 +84,7 @@ class EntryFlowConfig:
     oi_lookup_tolerance_minutes: int
     momentum_vwap_min_distance_pct: Decimal = Decimal("-0.5")
     momentum_vwap_max_distance_pct: Decimal = Decimal("0.5")
+    regime_trend_source: Literal["btc", "symbol"] = "btc"
 
 
 @dataclass(frozen=True)
@@ -178,6 +183,18 @@ class EntryFlow:
         btc_ema_trend = await self._calc_btc_ema_trend(btc_snap)
         btc_atr_pct = await self._calc_btc_atr_pct(btc_snap)
 
+        # PR D2: per-symbol レジーム情報も常時計算する（trend_source の
+        # 設定にかかわらず両方を埋めて signals に残し、事後 SQL で「もう
+        # 一方の mode だったら通っていたか」を再評価できるようにする）。
+        # symbol == "BTC" のときは同じデータなので API 重複を避けるため
+        # BTC の値をそのまま流用する。
+        if symbol == "BTC":
+            symbol_ema_trend = btc_ema_trend
+            symbol_atr_pct = btc_atr_pct
+        else:
+            symbol_ema_trend = await self._calc_ema_trend_for(symbol, market)
+            symbol_atr_pct = await self._calc_atr_pct_for(symbol, market)
+
         # OI 履歴
         oi_now = await self.exchange.get_open_interest(symbol)
         now_utc = datetime.now(UTC)
@@ -195,6 +212,8 @@ class EntryFlow:
             sentiment_confidence=float(sentiment.confidence),
             btc_ema_trend=btc_ema_trend,
             btc_atr_pct=btc_atr_pct,
+            symbol_ema_trend=symbol_ema_trend,
+            symbol_atr_pct=symbol_atr_pct,
             open_interest=float(oi_now),
             open_interest_1h_ago=float(oi_1h_ago_value),
         )
@@ -206,23 +225,43 @@ class EntryFlow:
             "UPTREND" / "DOWNTREND" / "NEUTRAL"
             ローソク足取得失敗・本数不足時は 24h 比較にフォールバック。
         """
+        return await self._calc_ema_trend_for("BTC", btc_snap)
+
+    async def _calc_btc_atr_pct(self, btc_snap: MarketSnapshot) -> float:
+        """BTC 15m ATR(14) を最新 close で割った %（章4 ④ REGIME）。
+
+        ローソク足取得失敗・本数不足時は 24h レンジ幅で代用。
+        """
+        return await self._calc_atr_pct_for("BTC", btc_snap)
+
+    async def _calc_ema_trend_for(
+        self, symbol: str, snap: MarketSnapshot
+    ) -> str:
+        """汎用版の EMA トレンド判定（PR D2）。
+
+        BTC・per-symbol で同じロジックを共有する。``symbol`` を変えれば
+        per-symbol REGIME (PR D2) が同じ経路を辿って計算できる。
+        フォールバックは渡された ``snap`` の 24h データを使う。
+        """
         try:
             candles = await self.exchange.get_candles(
-                symbol="BTC",
+                symbol=symbol,
                 interval=_BTC_REGIME_INTERVAL,
                 limit=_BTC_EMA_LIMIT,
             )
         except ExchangeError as e:
             logger.warning(
-                "BTC candles fetch failed for EMA: %s, falling back", e
+                "%s candles fetch failed for EMA: %s, falling back", symbol, e
             )
-            return self._fallback_btc_ema_trend(btc_snap)
+            return self._fallback_btc_ema_trend(snap)
 
         if len(candles) < _BTC_EMA_LONG_PERIOD:
             logger.warning(
-                "Not enough BTC candles for EMA50: got %d", len(candles)
+                "Not enough %s candles for EMA50: got %d",
+                symbol,
+                len(candles),
             )
-            return self._fallback_btc_ema_trend(btc_snap)
+            return self._fallback_btc_ema_trend(snap)
 
         closes = [c.close for c in candles]
         ema_short = calculate_ema(closes, period=_BTC_EMA_SHORT_PERIOD)
@@ -233,30 +272,33 @@ class EntryFlow:
             return "DOWNTREND"
         return "NEUTRAL"
 
-    async def _calc_btc_atr_pct(self, btc_snap: MarketSnapshot) -> float:
-        """BTC 15m ATR(14) を最新 close で割った %（章4 ④ REGIME）。
+    async def _calc_atr_pct_for(
+        self, symbol: str, snap: MarketSnapshot
+    ) -> float:
+        """汎用版の ATR% 計算（PR D2）。
 
-        ローソク足取得失敗・本数不足時は 24h レンジ幅で代用。
+        BTC・per-symbol で同じロジックを共有する。
         """
         try:
             candles = await self.exchange.get_candles(
-                symbol="BTC",
+                symbol=symbol,
                 interval=_BTC_REGIME_INTERVAL,
                 limit=_BTC_ATR_LIMIT,
             )
         except ExchangeError as e:
             logger.warning(
-                "BTC candles fetch failed for ATR: %s, falling back", e
+                "%s candles fetch failed for ATR: %s, falling back", symbol, e
             )
-            return self._fallback_btc_atr_pct(btc_snap)
+            return self._fallback_btc_atr_pct(snap)
 
         if len(candles) < _BTC_ATR_PERIOD + 1:
             logger.warning(
-                "Not enough BTC candles for ATR(%d): got %d",
+                "Not enough %s candles for ATR(%d): got %d",
+                symbol,
                 _BTC_ATR_PERIOD,
                 len(candles),
             )
-            return self._fallback_btc_atr_pct(btc_snap)
+            return self._fallback_btc_atr_pct(snap)
 
         highs = [c.high for c in candles]
         lows = [c.low for c in candles]
@@ -291,6 +333,7 @@ class EntryFlow:
                 vwap_max_distance_pct=float(
                     self.config.momentum_vwap_max_distance_pct
                 ),
+                regime_trend_source=self.config.regime_trend_source,
             )
         else:
             decision = judge_short_entry(
@@ -298,6 +341,7 @@ class EntryFlow:
                 vwap_min_distance_pct=float(
                     self.config.momentum_vwap_min_distance_pct
                 ),
+                regime_trend_source=self.config.regime_trend_source,
             )
         if not self.config.flow_layer_enabled:
             decision = self._bypass_flow(decision, direction)
@@ -344,6 +388,44 @@ class EntryFlow:
         direction: Literal["LONG", "SHORT"],
         decision: EntryDecision,
     ) -> None:
+        # PR D2: 両モード（btc / symbol）の REGIME 判定結果を記録する。
+        # CORE の判定関数を直接 trend_source 違いで 2 回呼ぶ（純関数で
+        # 軽量・追加 API は無し）。実際にエントリーに使われた active な
+        # 方は ``active_trend_source`` で分かる。事後 SQL で
+        # ``json_extract(snapshot_excerpt, '$.regime_symbol_passed')`` 等を
+        # 集計すれば、profile を切り替えていたら何 cycle 通過したかを
+        # 再計算できる（PR C1 と同じ哲学・章20.4.B）。
+        if direction == "LONG":
+            regime_btc_passed = judge_long_entry(
+                snapshot,
+                vwap_max_distance_pct=float(
+                    self.config.momentum_vwap_max_distance_pct
+                ),
+                regime_trend_source="btc",
+            ).layer_results.get("regime", False)
+            regime_symbol_passed = judge_long_entry(
+                snapshot,
+                vwap_max_distance_pct=float(
+                    self.config.momentum_vwap_max_distance_pct
+                ),
+                regime_trend_source="symbol",
+            ).layer_results.get("regime", False)
+        else:
+            regime_btc_passed = judge_short_entry(
+                snapshot,
+                vwap_min_distance_pct=float(
+                    self.config.momentum_vwap_min_distance_pct
+                ),
+                regime_trend_source="btc",
+            ).layer_results.get("regime", False)
+            regime_symbol_passed = judge_short_entry(
+                snapshot,
+                vwap_min_distance_pct=float(
+                    self.config.momentum_vwap_min_distance_pct
+                ),
+                regime_trend_source="symbol",
+            ).layer_results.get("regime", False)
+
         snapshot_excerpt = json.dumps(
             {
                 "current_price": snapshot.current_price,
@@ -351,6 +433,12 @@ class EntryFlow:
                 "momentum_5bar_pct": snapshot.momentum_5bar_pct,
                 "sentiment_score": snapshot.sentiment_score,
                 "btc_ema_trend": snapshot.btc_ema_trend,
+                # PR D2: per-symbol REGIME のデータと両モード判定結果
+                "symbol_ema_trend": snapshot.symbol_ema_trend,
+                "symbol_atr_pct": snapshot.symbol_atr_pct,
+                "regime_btc_passed": regime_btc_passed,
+                "regime_symbol_passed": regime_symbol_passed,
+                "active_trend_source": self.config.regime_trend_source,
             }
         )
         timestamp = datetime.now(UTC)

@@ -371,3 +371,109 @@ class TestShortVwapDistanceInjection:
         )
         assert decision.should_enter is False
         assert decision.rejection_reason == "layer_momentum_failed"
+
+
+# ────────────────────────────────────────────────
+# PR D2: REGIME の trend_source 注入
+# ────────────────────────────────────────────────
+
+
+class TestLongRegimeTrendSource:
+    """``judge_long_entry`` の ``regime_trend_source`` kwarg 切替（PR D2）。
+
+    BTC は DOWNTREND だが対象 symbol は UPTREND、という背反シナリオで
+    "btc" / "symbol" の判定差が出る。
+    """
+
+    def test_btc_source_uses_btc_ema_trend(self) -> None:
+        # btc=DOWNTREND・symbol=UPTREND → "btc" は LONG REGIME ✗
+        snap = make_snapshot(
+            btc_ema_trend="DOWNTREND",
+            symbol_ema_trend="UPTREND",
+            symbol_atr_pct=2.0,
+        )
+        decision = judge_long_entry(snap, regime_trend_source="btc")
+        assert decision.layer_results["regime"] is False
+        assert decision.rejection_reason == "layer_regime_failed"
+
+    def test_symbol_source_uses_symbol_ema_trend(self) -> None:
+        # 同じ snapshot を "symbol" で判定 → LONG REGIME ✓
+        snap = make_snapshot(
+            btc_ema_trend="DOWNTREND",
+            symbol_ema_trend="UPTREND",
+            symbol_atr_pct=2.0,
+        )
+        decision = judge_long_entry(snap, regime_trend_source="symbol")
+        assert decision.should_enter is True
+        assert decision.layer_results["regime"] is True
+
+    def test_symbol_source_with_high_atr_rejects(self) -> None:
+        # symbol の ATR% が閾値超なら "symbol" でも REGIME ✗
+        snap = make_snapshot(
+            btc_ema_trend="UPTREND",
+            symbol_ema_trend="UPTREND",
+            symbol_atr_pct=99.0,  # > 5.0 (_LONG_BTC_ATR_PCT_MAX)
+        )
+        decision = judge_long_entry(snap, regime_trend_source="symbol")
+        assert decision.layer_results["regime"] is False
+
+    def test_default_is_btc_source(self) -> None:
+        # kwarg 省略時は "btc" として振る舞う（後方互換）
+        snap = make_snapshot(
+            btc_ema_trend="UPTREND",
+            symbol_ema_trend="DOWNTREND",  # symbol は逆だが BTC を見る
+        )
+        decision = judge_long_entry(snap)
+        assert decision.layer_results["regime"] is True
+
+
+class TestShortRegimeTrendSource:
+    """``judge_short_entry`` の ``regime_trend_source`` kwarg 切替（PR D2）。"""
+
+    def test_btc_source_passes_when_btc_downtrend(self) -> None:
+        # btc=DOWNTREND（SHORT 望ましい）・symbol=UPTREND → "btc" SHORT ✓
+        snap = make_short_snapshot(
+            btc_ema_trend="DOWNTREND",
+            symbol_ema_trend="UPTREND",
+        )
+        decision = judge_short_entry(snap, regime_trend_source="btc")
+        assert decision.layer_results["regime"] is True
+
+    def test_symbol_source_rejects_when_symbol_uptrend(self) -> None:
+        # 同じ snapshot を "symbol" で判定 → 銘柄は UPTREND・funding も
+        # 過熱なし → SHORT REGIME ✗
+        snap = make_short_snapshot(
+            btc_ema_trend="DOWNTREND",
+            symbol_ema_trend="UPTREND",
+            funding_rate=0.005,
+        )
+        decision = judge_short_entry(snap, regime_trend_source="symbol")
+        assert decision.layer_results["regime"] is False
+
+    def test_symbol_source_passes_when_funding_overheated_even_uptrend(self) -> None:
+        # funding 過熱があれば symbol が UPTREND でも SHORT REGIME ✓
+        # (LONG/SHORT 非対称: SHORT は (NOT UPTREND) OR funding 過熱)
+        snap = make_short_snapshot(
+            btc_ema_trend="UPTREND",
+            symbol_ema_trend="UPTREND",
+            funding_rate=0.05,  # > 0.03 (_SHORT_FUNDING_RATE_OVERHEATED)
+        )
+        decision = judge_short_entry(snap, regime_trend_source="symbol")
+        assert decision.layer_results["regime"] is True
+
+
+class TestMarketSnapshotDefaults:
+    """PR D2 で追加された per-symbol REGIME フィールドの default 値。"""
+
+    def test_symbol_ema_trend_default_is_neutral(self) -> None:
+        # NEUTRAL → "btc" モードでは何の影響もない（後方互換確認）
+        snap = make_snapshot()
+        assert snap.symbol_ema_trend == "NEUTRAL"
+        assert snap.symbol_atr_pct == 0.0
+
+    def test_neutral_symbol_trend_rejects_long_under_symbol_source(self) -> None:
+        # symbol_ema_trend のデフォルト NEUTRAL は UPTREND ではないので
+        # "symbol" モードに切り替えると LONG REGIME ✗ になる。
+        snap = make_snapshot(btc_ema_trend="UPTREND")  # symbol_* は default
+        decision = judge_long_entry(snap, regime_trend_source="symbol")
+        assert decision.layer_results["regime"] is False

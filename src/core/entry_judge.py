@@ -14,8 +14,15 @@ APPLICATION層側のコスト最適化と意味論を揃えるため。
 
 from __future__ import annotations
 
+from typing import Literal
+
 from src.core.models import EntryDecision, MarketSnapshot
 from src.core.price_context import is_not_overheated_long, is_not_overheated_short
+
+# PR D2: REGIME 判定で EMA トレンドの出所を選ぶための型。
+# "btc": 従来通り BTC レジーム（snap.btc_ema_trend / snap.btc_atr_pct）
+# "symbol": 銘柄自身の 15m EMA20/50 と ATR（snap.symbol_ema_trend ほか）
+RegimeTrendSource = Literal["btc", "symbol"]
 
 # ───────────────────────────────────────────────
 # LONG 閾値（章4・章7）
@@ -61,17 +68,23 @@ def judge_long_entry(
     snap: MarketSnapshot,
     *,
     vwap_max_distance_pct: float = _LONG_VWAP_MAX_DISTANCE_PCT,
+    regime_trend_source: RegimeTrendSource = "btc",
 ) -> EntryDecision:
     """LONG エントリー判定（純関数）。
 
     PR C1: ``vwap_max_distance_pct`` を kwarg で注入可能にした。
     省略時は従来値 ``_LONG_VWAP_MAX_DISTANCE_PCT`` (=0.5)。
     profile_phase2.yaml では 1.0 に緩和（4 層通過頻度を上げるため）。
+
+    PR D2: ``regime_trend_source`` を kwarg で注入可能にした。
+    "btc" (デフォルト) は BTC レジームベース・"symbol" は銘柄自身の
+    15m EMA20/50 + ATR(14) ベース。profile_phase2.yaml の
+    ``regime.trend_source`` で切替（後方互換のためデフォルトは "btc"）。
     """
     layers = {
         "momentum": _check_momentum_long(snap, vwap_max_distance_pct),
         "flow": _check_flow_long(snap),
-        "regime": _check_regime_long(snap),
+        "regime": _check_regime_long(snap, regime_trend_source),
         "sentiment": _check_sentiment_long(snap),
     }
     return _build_decision(layers, direction="LONG")
@@ -81,17 +94,20 @@ def judge_short_entry(
     snap: MarketSnapshot,
     *,
     vwap_min_distance_pct: float = _SHORT_VWAP_MIN_DISTANCE_PCT,
+    regime_trend_source: RegimeTrendSource = "btc",
 ) -> EntryDecision:
     """SHORT エントリー判定（純関数）。
 
     PR C1: ``vwap_min_distance_pct`` を kwarg で注入可能にした。
     省略時は従来値 ``_SHORT_VWAP_MIN_DISTANCE_PCT`` (=-0.5)。
     profile_phase2.yaml では -1.0 に緩和。
+
+    PR D2: ``regime_trend_source`` を kwarg で注入可能にした。
     """
     layers = {
         "momentum": _check_momentum_short(snap, vwap_min_distance_pct),
         "flow": _check_flow_short(snap),
-        "regime": _check_regime_short(snap),
+        "regime": _check_regime_short(snap, regime_trend_source),
         "sentiment": _check_sentiment_short(snap),
     }
     return _build_decision(layers, direction="SHORT")
@@ -126,11 +142,19 @@ def _check_flow_long(snap: MarketSnapshot) -> bool:
     )
 
 
-def _check_regime_long(snap: MarketSnapshot) -> bool:
-    """章4 ④ REGIME + LIQUIDATION（LONG・章13.5の代替指標）。"""
+def _check_regime_long(
+    snap: MarketSnapshot,
+    trend_source: RegimeTrendSource = "btc",
+) -> bool:
+    """章4 ④ REGIME + LIQUIDATION（LONG・章13.5の代替指標）。
+
+    PR D2: ``trend_source`` で EMA トレンドと ATR の出所を切替。
+    funding_rate / OI / 閾値は共通（BTC.D 等は Phase 4 案件）。
+    """
+    ema_trend, atr_pct = _select_regime_inputs(snap, trend_source)
     return (
-        snap.btc_ema_trend == "UPTREND"
-        and snap.btc_atr_pct < _LONG_BTC_ATR_PCT_MAX
+        ema_trend == "UPTREND"
+        and atr_pct < _LONG_BTC_ATR_PCT_MAX
         and snap.funding_rate < _LONG_FUNDING_RATE_MAX
         and abs(snap.oi_change_1h_pct) < _LONG_OI_CHANGE_MAX_PCT
     )
@@ -177,10 +201,17 @@ def _check_flow_short(snap: MarketSnapshot) -> bool:
     )
 
 
-def _check_regime_short(snap: MarketSnapshot) -> bool:
-    """章4 ④ REGIME（SHORT）。BTC下降 OR Funding買い過熱、かつ OI 過熱なし。"""
+def _check_regime_short(
+    snap: MarketSnapshot,
+    trend_source: RegimeTrendSource = "btc",
+) -> bool:
+    """章4 ④ REGIME（SHORT）。BTC下降 OR Funding買い過熱、かつ OI 過熱なし。
+
+    PR D2: ``trend_source`` で EMA トレンドの出所を切替。
+    """
+    ema_trend, _ = _select_regime_inputs(snap, trend_source)
     btc_or_funding_bearish = (
-        snap.btc_ema_trend != "UPTREND" or snap.funding_rate > _SHORT_FUNDING_RATE_OVERHEATED
+        ema_trend != "UPTREND" or snap.funding_rate > _SHORT_FUNDING_RATE_OVERHEATED
     )
     return btc_or_funding_bearish and abs(snap.oi_change_1h_pct) < _LONG_OI_CHANGE_MAX_PCT
 
@@ -191,6 +222,20 @@ def _check_sentiment_short(snap: MarketSnapshot) -> bool:
         snap.sentiment_score < _SHORT_SENTIMENT_SCORE_MAX
         and snap.sentiment_confidence > _SHORT_SENTIMENT_CONFIDENCE_MIN
     )
+
+
+def _select_regime_inputs(
+    snap: MarketSnapshot, trend_source: RegimeTrendSource
+) -> tuple[str, float]:
+    """REGIME 判定で見る EMA トレンドと ATR% を ``trend_source`` で選ぶ。
+
+    PR D2 で導入。"btc" は従来の BTC レジーム、"symbol" は銘柄自身の値。
+    判定式そのものは ``_check_regime_long`` / ``_check_regime_short``
+    に集約し、ここでは値の選択だけを行う（CORE 純度維持）。
+    """
+    if trend_source == "symbol":
+        return snap.symbol_ema_trend, snap.symbol_atr_pct
+    return snap.btc_ema_trend, snap.btc_atr_pct
 
 
 # ───────────────────────────────────────────────

@@ -57,6 +57,14 @@ class MarketSnapshot:
     open_interest: float = 0.0
     open_interest_1h_ago: float = 0.0
 
+    # per-symbol レジーム（PR D2・章20.4.B）
+    # BTC ベースと同じ 15m EMA20/50 と ATR(14) を symbol 自身に当てたもの。
+    # 既存の判定経路は profile.regime.trend_source = "btc" がデフォルトの
+    # ため使われない。"symbol" に切り替えた時にのみ採用される。
+    # デフォルト値は既存テスト・他 profile への影響を避けるため。
+    symbol_ema_trend: str = "NEUTRAL"
+    symbol_atr_pct: float = 0.0
+
     # ─────────────────────────────────────────────
     # 派生プロパティ（章5 PriceContext 由来）
     # ─────────────────────────────────────────────

@@ -5,6 +5,7 @@ Protocol 実装はすべて AsyncMock で差し替え、INFRASTRUCTURE には触
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from decimal import Decimal
 from typing import Any, Literal
@@ -1024,3 +1025,110 @@ class TestMomentumVwapDistanceConfig:
         # いないのでエントリーまでは行かないが、momentum 通過の事実は届く)
         attempt = await flow.evaluate_and_enter("ETH", "SHORT")
         assert attempt.decision.layer_results["momentum"] is True
+
+
+# ─── PR D2: per-symbol REGIME ─────────────────────
+
+
+class TestPerSymbolRegime:
+    """per-symbol REGIME 計算と config 切替の integration test (PR D2)。
+
+    BTC は UPTREND だが ETH は DOWNTREND、というような background で、
+    `regime_trend_source` の値で判定経路が変わることを保証する。
+    両モードの判定結果は常に signals に記録される。
+    """
+
+    @pytest.mark.asyncio
+    async def test_symbol_ema_trend_populated_in_snapshot(self) -> None:
+        # ETH ローソク足を受け取れば snapshot.symbol_ema_trend が UPTREND になる
+        flow, _, _, _, _ = build_flow(
+            btc_candles=_uptrend_candles(60),  # BTC も ETH も同じ tuple を返す
+        )
+        attempt = await flow.evaluate_and_enter("ETH", "LONG")
+        assert attempt.snapshot.symbol_ema_trend == "UPTREND"
+        assert attempt.snapshot.symbol_atr_pct > 0.0
+
+    @pytest.mark.asyncio
+    async def test_btc_symbol_reuses_btc_regime_data(self) -> None:
+        # symbol="BTC" のときは API 重複を避けるため symbol_* = btc_* で再利用
+        flow, exchange, _, _, _ = build_flow(btc_candles=_uptrend_candles(60))
+        attempt = await flow.evaluate_and_enter("BTC", "LONG")
+        assert attempt.snapshot.btc_ema_trend == "UPTREND"
+        assert attempt.snapshot.symbol_ema_trend == "UPTREND"
+        # BTC は market_snapshot も REGIME 計算も 1 銘柄分しか走らない
+        assert exchange.get_market_snapshot.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_default_config_uses_btc_trend(self) -> None:
+        # snap: btc=UPTREND・symbol=DOWNTREND を強制 → default (btc) で
+        # LONG REGIME ✓、("symbol" だったら REGIME ✗)
+        snap = make_passing_long_snapshot(
+            btc_ema_trend="UPTREND",
+            symbol_ema_trend="DOWNTREND",
+            symbol_atr_pct=2.0,
+        )
+        flow, _, _, _, _ = build_flow(eth_snapshot=snap)
+        attempt = await flow.evaluate_and_enter("ETH", "LONG")
+        # symbol_* は build_snapshot で上書きされる前に passing snapshot で
+        # ETH 用の値が入っているが、_calc_ema_trend_for は btc_candles を
+        # 共有するので UPTREND になる。よって config=btc では REGIME ✓
+        assert attempt.decision.layer_results["regime"] is True
+
+    @pytest.mark.asyncio
+    async def test_symbol_config_uses_symbol_trend(self) -> None:
+        # btc=DOWNTREND の candles + symbol(ETH) も同じ candles を共有
+        # するので両方 DOWNTREND になる。LONG REGIME はどちらでも ✗
+        # → "symbol" mode が経路として届いていることを確認する間接テスト
+        flow, _, _, _, _ = build_flow(
+            btc_candles=_downtrend_candles(60),
+            config=make_config(regime_trend_source="symbol"),
+        )
+        attempt = await flow.evaluate_and_enter("ETH", "LONG")
+        assert attempt.decision.layer_results["regime"] is False
+        assert attempt.decision.rejection_reason == "layer_regime_failed"
+
+    @pytest.mark.asyncio
+    async def test_symbol_candle_fetch_failure_falls_back(self) -> None:
+        # ETH ローソク足取得失敗 → fallback の 24h 比較
+        # (BTC 用の candles は uptrend を返す前提で、symbol は別経路)
+        # 注: AsyncMock の side_effect は全シンボル共通なので、ここでは
+        # candles_side_effect で全 candle 呼びを失敗させて fallback 経路を強制
+        flow, _, _, _, _ = build_flow(
+            candles_side_effect=ExchangeError("rate limited"),
+        )
+        attempt = await flow.evaluate_and_enter("ETH", "LONG")
+        # fallback 経路でも snapshot は埋まる（UPTREND or DOWNTREND）
+        assert attempt.snapshot.symbol_ema_trend in ("UPTREND", "DOWNTREND")
+
+
+class TestSignalsRegimeFields:
+    """signals テーブルの snapshot_excerpt に PR D2 で追加されたフィールドが
+    入っていることの確認。事後 SQL で `IF mode=X だったら` を再計算する
+    ための前提となるデータ。"""
+
+    @pytest.mark.asyncio
+    async def test_snapshot_excerpt_contains_both_regime_results(self) -> None:
+        flow, _, _, repo, _ = build_flow(btc_candles=_uptrend_candles(60))
+        await flow.evaluate_and_enter("ETH", "LONG")
+        # 4 層分の log_signal が記録されている → 全部同じ snapshot_excerpt
+        first_call = repo.log_signal.await_args_list[0]
+        signal_log = first_call.args[0]
+        excerpt = json.loads(signal_log.snapshot_excerpt)
+        assert "regime_btc_passed" in excerpt
+        assert "regime_symbol_passed" in excerpt
+        assert "symbol_ema_trend" in excerpt
+        assert "symbol_atr_pct" in excerpt
+        assert "active_trend_source" in excerpt
+        assert excerpt["active_trend_source"] == "btc"  # default
+
+    @pytest.mark.asyncio
+    async def test_snapshot_excerpt_records_active_trend_source(self) -> None:
+        # config で symbol に切り替えると active_trend_source も "symbol"
+        flow, _, _, repo, _ = build_flow(
+            btc_candles=_uptrend_candles(60),
+            config=make_config(regime_trend_source="symbol"),
+        )
+        await flow.evaluate_and_enter("ETH", "LONG")
+        first_call = repo.log_signal.await_args_list[0]
+        excerpt = json.loads(first_call.args[0].snapshot_excerpt)
+        assert excerpt["active_trend_source"] == "symbol"

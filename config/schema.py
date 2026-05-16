@@ -122,6 +122,26 @@ class MomentumSettings(BaseModel):
     vwap_max_distance_pct: Decimal = Field(default=Decimal("0.5"))
 
 
+class RegimeSettings(BaseModel):
+    """REGIME 層の挙動（PR D2）。
+
+    ``trend_source``:
+        - "btc": EMA トレンドと ATR を BTC レジームから採用（従来通り）。
+          BTC と逆方向に動く局面でも EMA は BTC を見る前提。
+        - "symbol": 銘柄自身の 15m EMA20/50 と ATR(14) を採用。
+
+    どちらを採用しても entry_flow は両モードの判定結果を signals テーブル
+    （snapshot_excerpt）に並べて記録するため、事後 SQL で「IF mode=X
+    だったら何 cycle 通過したか」を再計算できる（PR C1 と同じ哲学）。
+
+    Phase 4 で BTC.D / combine_mode（btc AND symbol 等）に拡張する余地
+    があるが、PR D2 ではまず単純な切替のみ実装する。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    trend_source: Literal["btc", "symbol"] = "btc"
+
+
 class LoggingSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
@@ -152,4 +172,5 @@ class AppSettings(BaseModel):
     )
     entry_flow: EntryFlowSettings = Field(default_factory=EntryFlowSettings)
     momentum: MomentumSettings = Field(default_factory=MomentumSettings)
+    regime: RegimeSettings = Field(default_factory=RegimeSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)

@@ -86,6 +86,20 @@ scheduler:
   position_overflow_multiplier: 1.5
 
 # ───────────────────────────────────────────────
+# Regime: per-symbol REGIME 計算は常時走らせる（PR D2）
+# ───────────────────────────────────────────────
+# trend_source:
+#   "btc"    - 従来通り BTC レジームで判定（デフォルト・後方互換）
+#   "symbol" - 銘柄自身の 15m EMA20/50 + ATR(14) で判定
+#
+# Phase 2 では当面 "btc" を維持。entry_flow は両方を計算して
+# signals.snapshot_excerpt に並べて記録するので、データ蓄積後に
+# 事後 SQL で「symbol に切り替えていたら何 cycle 通過したか」を
+# 再計算してから判断する（PR C1 と同じ哲学）。
+regime:
+  trend_source: "btc"
+
+# ───────────────────────────────────────────────
 # Momentum: VWAP 距離帯を ±1.0% に緩和（PR C1）
 # ───────────────────────────────────────────────
 # 理由 (docs/PR7_6_8_design_consolidation_6.md §6 / §8 参照):
