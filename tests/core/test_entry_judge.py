@@ -7,11 +7,14 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
 from src.core.entry_judge import judge_long_entry, judge_short_entry
+from src.core.models import MarketSnapshot
 from tests.core.helpers import make_short_snapshot, make_snapshot
 
 # ────────────────────────────────────────────────
@@ -274,3 +277,97 @@ def test_short_judgment_is_total_function(momentum: float, funding: float) -> No
     decision = judge_short_entry(snap)
     assert isinstance(decision.should_enter, bool)
     assert decision.direction in (None, "SHORT")
+
+
+# ────────────────────────────────────────────────
+# PR C1: VWAP 距離帯の kwarg 注入
+# ────────────────────────────────────────────────
+
+
+def _wide_range_long_snapshot(current_price: float, **overrides: Any) -> MarketSnapshot:
+    """過熱フィルタを通過させるためレンジを広く取った LONG snapshot。"""
+    base: dict[str, Any] = dict(
+        current_price=current_price,
+        vwap=100.0,
+        utc_open_price=99.0,  # day change ~+1〜+2%
+        rolling_24h_open=99.0,
+        low_24h=90.0,
+        high_24h=110.0,  # range pos ~0.5
+    )
+    base.update(overrides)
+    return make_snapshot(**base)
+
+
+def _wide_range_short_snapshot(current_price: float, **overrides: Any) -> MarketSnapshot:
+    """過熱フィルタを通過させるためレンジを広く取った SHORT snapshot。"""
+    base: dict[str, Any] = dict(
+        current_price=current_price,
+        vwap=100.0,
+        utc_open_price=101.0,  # day change ~-1〜-3%
+        rolling_24h_open=101.0,
+        low_24h=90.0,
+        high_24h=110.0,  # range pos ~0.5
+    )
+    base.update(overrides)
+    return make_short_snapshot(**base)
+
+
+class TestLongVwapDistanceInjection:
+    """``judge_long_entry`` に ``vwap_max_distance_pct`` を注入した時の挙動。
+
+    PR C1: 既定 0.5% は強い上昇トレンドの本体を弾く。profile から 1.0% に
+    緩和すると同じ snapshot で MOMENTUM が通過するようになる。後方互換の
+    ため kwarg 省略時は従来動作。
+    """
+
+    def test_default_threshold_rejects_at_0_8_percent_above(self) -> None:
+        # 既定 0.5% 上限を超える +0.8% は MOMENTUM ✗
+        decision = judge_long_entry(_wide_range_long_snapshot(100.8))
+        assert decision.should_enter is False
+        assert decision.rejection_reason == "layer_momentum_failed"
+
+    def test_relaxed_threshold_accepts_same_snapshot(self) -> None:
+        # 同じ +0.8% でも上限を 1.0% に広げれば MOMENTUM ○
+        decision = judge_long_entry(
+            _wide_range_long_snapshot(100.8), vwap_max_distance_pct=1.0
+        )
+        assert decision.should_enter is True
+        assert decision.layer_results["momentum"] is True
+
+    def test_relaxed_threshold_still_rejects_above_new_band(self) -> None:
+        # 1.0% に広げても +1.2% は外れる
+        decision = judge_long_entry(
+            _wide_range_long_snapshot(101.2), vwap_max_distance_pct=1.0
+        )
+        assert decision.should_enter is False
+        assert decision.rejection_reason == "layer_momentum_failed"
+
+
+class TestShortVwapDistanceInjection:
+    """``judge_short_entry`` への ``vwap_min_distance_pct`` 注入。
+
+    5/15 ETH 急落で VWAP -2.8% まで離れて MOMENTUM ✗ になった経路の構造
+    緩和: -0.5 → -1.0 で帯を広げる (それでも -2.8 は外れる・上限ある)。
+    """
+
+    def test_default_threshold_rejects_at_0_8_percent_below(self) -> None:
+        # 既定 -0.5% 下限を超える -0.8% は MOMENTUM ✗
+        decision = judge_short_entry(_wide_range_short_snapshot(99.2))
+        assert decision.should_enter is False
+        assert decision.rejection_reason == "layer_momentum_failed"
+
+    def test_relaxed_threshold_accepts_same_snapshot(self) -> None:
+        # 同じ -0.8% でも下限を -1.0% に広げれば MOMENTUM ○
+        decision = judge_short_entry(
+            _wide_range_short_snapshot(99.2), vwap_min_distance_pct=-1.0
+        )
+        assert decision.should_enter is True
+        assert decision.layer_results["momentum"] is True
+
+    def test_relaxed_threshold_still_rejects_beyond_new_band(self) -> None:
+        # -1.0 に広げても -2.8% (5/15 ETH 実例相当) は外れる
+        decision = judge_short_entry(
+            _wide_range_short_snapshot(97.2), vwap_min_distance_pct=-1.0
+        )
+        assert decision.should_enter is False
+        assert decision.rejection_reason == "layer_momentum_failed"

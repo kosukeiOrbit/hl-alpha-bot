@@ -57,10 +57,19 @@ _SHORT_FUNDING_RATE_OVERHEATED = 0.03
 # ───────────────────────────────────────────────
 
 
-def judge_long_entry(snap: MarketSnapshot) -> EntryDecision:
-    """LONG エントリー判定（純関数）。"""
+def judge_long_entry(
+    snap: MarketSnapshot,
+    *,
+    vwap_max_distance_pct: float = _LONG_VWAP_MAX_DISTANCE_PCT,
+) -> EntryDecision:
+    """LONG エントリー判定（純関数）。
+
+    PR C1: ``vwap_max_distance_pct`` を kwarg で注入可能にした。
+    省略時は従来値 ``_LONG_VWAP_MAX_DISTANCE_PCT`` (=0.5)。
+    profile_phase2.yaml では 1.0 に緩和（4 層通過頻度を上げるため）。
+    """
     layers = {
-        "momentum": _check_momentum_long(snap),
+        "momentum": _check_momentum_long(snap, vwap_max_distance_pct),
         "flow": _check_flow_long(snap),
         "regime": _check_regime_long(snap),
         "sentiment": _check_sentiment_long(snap),
@@ -68,10 +77,19 @@ def judge_long_entry(snap: MarketSnapshot) -> EntryDecision:
     return _build_decision(layers, direction="LONG")
 
 
-def judge_short_entry(snap: MarketSnapshot) -> EntryDecision:
-    """SHORT エントリー判定（純関数）。"""
+def judge_short_entry(
+    snap: MarketSnapshot,
+    *,
+    vwap_min_distance_pct: float = _SHORT_VWAP_MIN_DISTANCE_PCT,
+) -> EntryDecision:
+    """SHORT エントリー判定（純関数）。
+
+    PR C1: ``vwap_min_distance_pct`` を kwarg で注入可能にした。
+    省略時は従来値 ``_SHORT_VWAP_MIN_DISTANCE_PCT`` (=-0.5)。
+    profile_phase2.yaml では -1.0 に緩和。
+    """
     layers = {
-        "momentum": _check_momentum_short(snap),
+        "momentum": _check_momentum_short(snap, vwap_min_distance_pct),
         "flow": _check_flow_short(snap),
         "regime": _check_regime_short(snap),
         "sentiment": _check_sentiment_short(snap),
@@ -84,13 +102,16 @@ def judge_short_entry(snap: MarketSnapshot) -> EntryDecision:
 # ───────────────────────────────────────────────
 
 
-def _check_momentum_long(snap: MarketSnapshot) -> bool:
+def _check_momentum_long(
+    snap: MarketSnapshot, vwap_max_distance_pct: float
+) -> bool:
     """章4 ① MOMENTUM + POSITION（LONG）。
 
     過熱フィルター（章5）は price_context.is_not_overheated_long に委譲。
+    PR C1: ``vwap_max_distance_pct`` を呼び出し元から受け取る。
     """
     return (
-        0 < snap.vwap_distance_pct < _LONG_VWAP_MAX_DISTANCE_PCT
+        0 < snap.vwap_distance_pct < vwap_max_distance_pct
         and is_not_overheated_long(snap)
         and snap.momentum_5bar_pct > _LONG_MOMENTUM_5BAR_MIN_PCT
     )
@@ -129,13 +150,16 @@ def _check_sentiment_long(snap: MarketSnapshot) -> bool:
     )
 
 
-def _check_momentum_short(snap: MarketSnapshot) -> bool:
+def _check_momentum_short(
+    snap: MarketSnapshot, vwap_min_distance_pct: float
+) -> bool:
     """章4 ① MOMENTUM + POSITION（SHORT・LONGと対称）。
 
     過熱フィルター（章5）は price_context.is_not_overheated_short に委譲。
+    PR C1: ``vwap_min_distance_pct`` を呼び出し元から受け取る。
     """
     return (
-        _SHORT_VWAP_MIN_DISTANCE_PCT < snap.vwap_distance_pct < 0
+        vwap_min_distance_pct < snap.vwap_distance_pct < 0
         and is_not_overheated_short(snap)
         and snap.momentum_5bar_pct < _SHORT_MOMENTUM_5BAR_MAX_PCT
     )

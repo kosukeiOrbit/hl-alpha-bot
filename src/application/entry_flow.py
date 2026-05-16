@@ -63,7 +63,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class EntryFlowConfig:
-    """entry_flow 動作設定（章23 settings.yaml から渡される）。"""
+    """entry_flow 動作設定（章23 settings.yaml から渡される）。
+
+    PR C1: ``momentum_vwap_min_distance_pct`` / ``momentum_vwap_max_distance_pct``
+    を追加。CORE の judge_long_entry / judge_short_entry に注入することで
+    profile 経由で帯幅を上書き可能にする。省略時は従来値 ±0.5 が CORE 側の
+    kwarg デフォルトに残っているため、テスト・既存 profile への影響は無い。
+    """
 
     is_dry_run: bool
     leverage: int
@@ -72,6 +78,8 @@ class EntryFlowConfig:
     sl_atr_mult: Decimal
     tp_atr_mult: Decimal
     oi_lookup_tolerance_minutes: int
+    momentum_vwap_min_distance_pct: Decimal = Decimal("-0.5")
+    momentum_vwap_max_distance_pct: Decimal = Decimal("0.5")
 
 
 @dataclass(frozen=True)
@@ -277,11 +285,20 @@ class EntryFlow:
         snapshot: MarketSnapshot,
         direction: Literal["LONG", "SHORT"],
     ) -> EntryDecision:
-        decision = (
-            judge_long_entry(snapshot)
-            if direction == "LONG"
-            else judge_short_entry(snapshot)
-        )
+        if direction == "LONG":
+            decision = judge_long_entry(
+                snapshot,
+                vwap_max_distance_pct=float(
+                    self.config.momentum_vwap_max_distance_pct
+                ),
+            )
+        else:
+            decision = judge_short_entry(
+                snapshot,
+                vwap_min_distance_pct=float(
+                    self.config.momentum_vwap_min_distance_pct
+                ),
+            )
         if not self.config.flow_layer_enabled:
             decision = self._bypass_flow(decision, direction)
         return decision

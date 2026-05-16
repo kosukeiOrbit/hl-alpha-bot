@@ -177,6 +177,12 @@ def build_scheduler(
             oi_lookup_tolerance_minutes=(
                 settings.entry_flow.oi_lookup_tolerance_minutes
             ),
+            momentum_vwap_min_distance_pct=(
+                settings.momentum.vwap_min_distance_pct
+            ),
+            momentum_vwap_max_distance_pct=(
+                settings.momentum.vwap_max_distance_pct
+            ),
         ),
     )
 

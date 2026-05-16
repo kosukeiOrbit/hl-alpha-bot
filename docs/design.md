@@ -590,6 +590,14 @@ if -0.5 < distance_pct < 0:          # VWAPから-0.5%以内
     layer1_position_pass = True
 ```
 
+**PR C1 (2026-05-16) 補足:** 帯幅 0.5% は profile から上書き可能になった。
+``config/profile_phase2.yaml`` の ``momentum.vwap_min_distance_pct`` /
+``momentum.vwap_max_distance_pct`` で指定する。profile 未指定時は従来値
+±0.5% で動作する（``judge_long_entry`` / ``judge_short_entry`` の kwarg
+デフォルトに従来値を残しているため、CORE 単体テストや Phase 0/1 profile
+に影響しない）。Phase 2 では ±1.0% に緩和。背景は
+``docs/PR7_6_8_design_consolidation_6.md`` §6 / §8 を参照。
+
 ### 6.4 保有中VWAP挙動の追跡（重要）
 
 moomooの教訓「VWAP記録のみで未活用」を解決するため、
@@ -3320,6 +3328,20 @@ def _check_regime_long(snap: MarketSnapshot) -> bool:
 - I/Oは一切なし（async/awaitもなし）
 - グローバル変数なし
 - 純粋関数なので**何度呼んでも同じ結果**
+
+**PR C1 (2026-05-16) 補足:** 「閾値はまずハードコード・将来 config 注入予定」
+としていたうち、VWAP 距離帯 (LONG/SHORT) を **kwarg で注入可能** にした。
+``judge_long_entry(snap, *, vwap_max_distance_pct: float = _LONG_VWAP_MAX_DISTANCE_PCT)``
+の形を取り、省略時は従来値 (±0.5) を使う。APPLICATION 層
+(``EntryFlow._judge``) が ``EntryFlowConfig`` 経由で profile の値を流し込む。
+
+この設計の整合性:
+- CORE は値を受け取るだけ・分岐は無い → 純度を維持
+- 既存の `judge_long_entry(snap)` 呼び出し (テスト・他経路) はそのまま動く
+- profile 未設定なら従来の挙動・指定すれば即時反映
+
+momentum_5bar_pct / SENTIMENT 閾値 / REGIME / 過熱フィルタは同じパターンで
+段階的に config 注入化していく余地がある (実機データを蓄積してから判断)。
 
 ### 11.5 ADAPTERS層の具体例：Protocol定義
 

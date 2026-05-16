@@ -952,3 +952,75 @@ class TestDirectionLiteral:
         attempt = await flow.evaluate_and_enter("ETH", direction)
         assert attempt.symbol == "ETH"
         assert attempt.direction == direction
+
+
+# ─── PR C1: VWAP 距離帯の config 注入 ─────────────────
+
+
+class TestMomentumVwapDistanceConfig:
+    """EntryFlowConfig 経由で MOMENTUM 帯幅を上書きできることの確認 (PR C1)。
+
+    profile_phase2.yaml で momentum.vwap_min/max_distance_pct を設定した時、
+    その値が CORE の judge_long_entry / judge_short_entry に届く経路の
+    integration test。CORE 側 kwarg 注入の単体テストは
+    tests/core/test_entry_judge.py に存在する。
+    """
+
+    @pytest.mark.asyncio
+    async def test_default_config_rejects_at_0_8_percent_above_vwap(self) -> None:
+        # 既定の 0.5% 上限を超える VWAP +0.8% の snapshot → MOMENTUM ✗
+        # range は十分に広く取って過熱フィルタは通過させ、VWAP 距離だけで
+        # 弾かれていることを保証する。
+        snap = make_passing_long_snapshot(
+            current_price=3024.0,  # vwap 3000 から +0.8%
+            vwap=3000.0,
+            high_24h=3200.0,
+            low_24h=2800.0,  # range_pos ≈ 0.56 (< 0.85)
+        )
+        flow, exchange, _, _, _ = build_flow(eth_snapshot=snap)
+        attempt = await flow.evaluate_and_enter("ETH", "LONG")
+        assert attempt.decision.should_enter is False
+        assert attempt.decision.rejection_reason == "layer_momentum_failed"
+        exchange.place_orders_grouped.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_relaxed_config_accepts_same_snapshot(self) -> None:
+        # 同じ +0.8% でも config で 1.0% に広げれば MOMENTUM ○ → 発注に進む
+        snap = make_passing_long_snapshot(
+            current_price=3024.0,
+            vwap=3000.0,
+            high_24h=3200.0,
+            low_24h=2800.0,
+        )
+        flow, exchange, _, _, _ = build_flow(
+            eth_snapshot=snap,
+            config=make_config(
+                momentum_vwap_max_distance_pct=Decimal("1.0"),
+            ),
+        )
+        attempt = await flow.evaluate_and_enter("ETH", "LONG")
+        assert attempt.decision.should_enter is True
+        assert attempt.decision.layer_results["momentum"] is True
+        exchange.place_orders_grouped.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_short_config_relaxation_routes_to_judge(self) -> None:
+        # SHORT 側も同様に届くこと。VWAP -0.8% で既定はNG、-1.0 に緩めると OK。
+        # momentum_5bar_pct も SHORT 用に反転させる必要がある。
+        snap = make_passing_long_snapshot(
+            current_price=2976.0,  # vwap 3000 から -0.8%
+            vwap=3000.0,
+            momentum_5bar_pct=-0.5,  # SHORT 用 < -0.3
+            high_24h=3200.0,
+            low_24h=2800.0,
+        )
+        flow, _, _, _, _ = build_flow(
+            eth_snapshot=snap,
+            config=make_config(
+                momentum_vwap_min_distance_pct=Decimal("-1.0"),
+            ),
+        )
+        # SHORT 評価で momentum 層が True になる (他層は SHORT 用に揃って
+        # いないのでエントリーまでは行かないが、momentum 通過の事実は届く)
+        attempt = await flow.evaluate_and_enter("ETH", "SHORT")
+        assert attempt.decision.layer_results["momentum"] is True

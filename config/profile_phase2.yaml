@@ -86,6 +86,25 @@ scheduler:
   position_overflow_multiplier: 1.5
 
 # ───────────────────────────────────────────────
+# Momentum: VWAP 距離帯を ±1.0% に緩和（PR C1）
+# ───────────────────────────────────────────────
+# 理由 (docs/PR7_6_8_design_consolidation_6.md §6 / §8 参照):
+#   既定 ±0.5% は BTC の 5 分足数本分・ETH/ALT では数十秒〜数分の
+#   薄帯で、4 層 AND の通過頻度を支配する強い制約になっていた
+#   （mainnet 数日 0 件継続）。
+#   PR A1 + B1 + B2 で連発・誤クローズ・宙ぶらりん注文を構造的に
+#   閉じたため、エントリー機会側を一段だけ緩める。
+#
+# 注意:
+#   - momentum_5bar_pct (±0.3%) は触らない（実機データ蓄積後に判断）。
+#   - SENTIMENT / REGIME / 過熱フィルタも維持。
+#   - 緩めれば追っかけ SHORT のリスクも増えるが、signals テーブルの
+#     snapshot_excerpt から事後に再検証できるので不可逆ではない。
+momentum:
+  vwap_min_distance_pct: -1.0   # SHORT: -1.0% < dist < 0
+  vwap_max_distance_pct: 1.0    # LONG:  0 < dist < +1.0%
+
+# ───────────────────────────────────────────────
 # Storage: mainnet 専用 DB
 # ───────────────────────────────────────────────
 # testnet の hl_bot.db とは別ファイルで運用

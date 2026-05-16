@@ -107,6 +107,21 @@ class EntryFlowSettings(BaseModel):
     oi_lookup_tolerance_minutes: int = Field(ge=0, default=5)
 
 
+class MomentumSettings(BaseModel):
+    """MOMENTUM 層の閾値（PR C1）。
+
+    profile 未指定時のデフォルト ±0.5% は PR C1 以前のハードコード値。
+    Phase 2 では profile_phase2.yaml で ±1.0% に緩和して mean-reversion
+    band を広げる（強いトレンドの本体に入りにくい構造はそのまま）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    # SHORT: vwap_min_distance_pct < dist < 0
+    vwap_min_distance_pct: Decimal = Field(default=Decimal("-0.5"))
+    # LONG: 0 < dist < vwap_max_distance_pct
+    vwap_max_distance_pct: Decimal = Field(default=Decimal("0.5"))
+
+
 class LoggingSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
@@ -136,4 +151,5 @@ class AppSettings(BaseModel):
         default_factory=ReconciliationSettings
     )
     entry_flow: EntryFlowSettings = Field(default_factory=EntryFlowSettings)
+    momentum: MomentumSettings = Field(default_factory=MomentumSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
